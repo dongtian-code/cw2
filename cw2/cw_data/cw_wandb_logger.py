@@ -156,10 +156,15 @@ class WandBLogger(cw_logging.AbstractLogger):
                 and log_step >= self.cw2_config["iterations"] - 1
             )
 
-            # Skip logging if interval is defined but not satisfied
+            # Skip logging if interval is defined but not satisfied.
+            # Keep the first point and final point even when they are not exact
+            # multiples of log_interval.
             log_interval = self.config.get("log_interval", None)
+            first_iteration = log_step is not None and log_step <= 1
             if (
                 log_interval is not None
+                and log_step is not None
+                and not first_iteration
                 and not final_iteration
                 and log_step % log_interval != 0
             ):
