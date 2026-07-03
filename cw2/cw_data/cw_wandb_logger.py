@@ -112,9 +112,12 @@ class WandBLogger(cw_logging.AbstractLogger):
             os.environ.get("MPRL_WANDB_CACHE_DIR", None)
             or self.config.get("cache_dir", None)
         )
-        for path in (self.wandb_local_dir, self.wandb_cache_dir):
-            if path is not None:
-                os.makedirs(path, exist_ok=True)
+        self.wandb_local_dir = self._ensure_optional_dir(
+            self.wandb_local_dir, "wandb local_dir"
+        )
+        self.wandb_cache_dir = self._ensure_optional_dir(
+            self.wandb_cache_dir, "wandb cache_dir"
+        )
         if self.wandb_cache_dir is not None:
             os.environ["WANDB_CACHE_DIR"] = self.wandb_cache_dir
         # Get the model logging directory
@@ -143,6 +146,20 @@ class WandBLogger(cw_logging.AbstractLogger):
         if "$" in path:
             return None
         return os.path.abspath(path)
+
+    @staticmethod
+    def _ensure_optional_dir(path, name):
+        if path is None:
+            return None
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except OSError as error:
+            warnings.warn(
+                f"Could not create {name} at {path}: {error}. "
+                "Falling back to the run log directory."
+            )
+            return None
 
     def connect_to_wandb(self):
         last_error = None
