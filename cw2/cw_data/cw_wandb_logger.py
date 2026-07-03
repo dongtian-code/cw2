@@ -24,6 +24,10 @@ def reset_wandb_env():
         "WANDB_ENTITY",
         "WANDB_API_KEY",
         "WANDB_START_METHOD",
+        "WANDB_DIR",
+        "WANDB_CACHE_DIR",
+        "WANDB_CONFIG_DIR",
+        "WANDB_DATA_DIR",
     }
     for k, v in os.environ.items():
         if k.startswith("WANDB_") and k not in exclude:
@@ -100,14 +104,45 @@ class WandBLogger(cw_logging.AbstractLogger):
         # have entity and group config entry optional
         self.entity = self.config.get("entity", None)
         self.group = self.config.get("group", None)
+        self.wandb_local_dir = self._optional_path(
+            os.environ.get("MPRL_WANDB_DIR", None)
+            or self.config.get("local_dir", None)
+        )
+        self.wandb_cache_dir = self._optional_path(
+            os.environ.get("MPRL_WANDB_CACHE_DIR", None)
+            or self.config.get("cache_dir", None)
+        )
+        for path in (self.wandb_local_dir, self.wandb_cache_dir):
+            if path is not None:
+                os.makedirs(path, exist_ok=True)
+        if self.wandb_cache_dir is not None:
+            os.environ["WANDB_CACHE_DIR"] = self.wandb_cache_dir
         # Get the model logging directory
         self.wandb_log_model = self.config.get("log_model", False)
+        self.wandb_log_checkpoint_state = self.config.get(
+            "log_checkpoint_state", True
+        )
+        self.model_artifact_exclude = set(
+            self.config.get("model_artifact_exclude", [])
+        )
         if self.wandb_log_model:
             self.save_model_dir = os.path.join(self.log_path, "model")
             self.cw2_config["save_model_dir"] = self.save_model_dir
             self.model_name = self.config.get("model_name", "model")
         else:
             self.save_model_dir = None
+
+    @staticmethod
+    def _optional_path(path):
+        if path is None:
+            return None
+        path = str(path).strip()
+        if path == "" or path.lower() in {"none", "null", "false"}:
+            return None
+        path = os.path.expanduser(os.path.expandvars(path))
+        if "$" in path:
+            return None
+        return os.path.abspath(path)
 
     def connect_to_wandb(self):
         last_error = None
@@ -120,7 +155,7 @@ class WandBLogger(cw_logging.AbstractLogger):
                     job_type=self.job_name[:63],
                     name=self.runname[:63],
                     config=self.cw2_config["params"],
-                    dir=self.log_path,
+                    dir=self.wandb_local_dir or self.log_path,
                     settings=wandb.Settings(
                         _disable_stats=self.cw2_config["wandb"].get(
                             "disable_stats", False
@@ -273,13 +308,37 @@ class WandBLogger(cw_logging.AbstractLogger):
             return
 
         # Add files into artifact
+        logged_file_count = 0
         for file in file_names:
+            if not self._should_log_model_file(file):
+                continue
             model_artifact.add_file(os.path.join(self.save_model_dir, file))
+            logged_file_count += 1
+
+        if logged_file_count == 0:
+            warnings.warn("save model dir has no files selected for wandb upload.")
+            return
 
         aliases = ["latest", f"finished-rep-{self.rep}"]
 
         # Log and upload
         self.run.log_artifact(model_artifact, aliases=aliases)
+
+    def _should_log_model_file(self, file_name):
+        base_name = os.path.basename(file_name)
+        if base_name in self.model_artifact_exclude:
+            return False
+        if base_name.endswith(".tmp") or ".tmp." in base_name:
+            return False
+        if (
+                not self.wandb_log_checkpoint_state
+                and (
+                    base_name == "checkpoint_state"
+                    or base_name.startswith("checkpoint_state_")
+                )
+        ):
+            return False
+        return True
 
     def log_plot(self, x, y, column_names=("x", "y"), plot_id="plot", title="Plot"):
         data = [list(i) for i in zip(x, y)]
