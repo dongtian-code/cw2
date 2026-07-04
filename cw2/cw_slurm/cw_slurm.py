@@ -594,6 +594,43 @@ class SlurmDirectoryManager:
             return copied_root
         return os.path.join(copied_root, rel_cwd)
 
+    def get_config_exec_path(self, config_path: str) -> str:
+        """Copy runtime-generated config into CODE_COPY and return its exec path."""
+        if self.m in [self.MODE_NOCOPY, self.MODE_ZIP]:
+            return config_path
+
+        src = os.path.abspath(self.get_exp_src())
+        config_path = os.path.abspath(config_path)
+        try:
+            if os.path.commonpath([src, config_path]) != src:
+                return config_path
+        except ValueError:
+            return config_path
+
+        rel_config_path = os.path.relpath(config_path, src)
+        if self.m == self.MODE_COPY:
+            copied_config_path = os.path.join(
+                os.path.abspath(self.get_exp_dst()), rel_config_path
+            )
+            self._copy_runtime_config(config_path, copied_config_path)
+            return copied_config_path
+
+        if self.m == self.MODE_MULTI:
+            dst_base = os.path.abspath(self.get_exp_dst())
+            for idx in range(self.slurm_config.slurm_conf[SKEYS.LAST_IDX] + 1):
+                self._copy_runtime_config(
+                    config_path,
+                    os.path.join(dst_base, str(idx), rel_config_path),
+                )
+            return os.path.join(dst_base, "$SLURM_ARRAY_TASK_ID", rel_config_path)
+
+        return config_path
+
+    @staticmethod
+    def _copy_runtime_config(src: str, dst: str):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+
     def get_py_path(self) -> str:
         """computes a modified python path, depending on the experiment_copy procedure
 
@@ -658,6 +695,7 @@ def write_slurm_script(slurm_conf: SlurmConfig, dir_mgr: SlurmDirectoryManager) 
     output_path = sc[SKEYS.SLURM_OUT]
 
     exp_main_file = os.path.relpath(__main__.__file__, os.getcwd())
+    config_exec_path = dir_mgr.get_config_exec_path(conf.config_path)
 
     fid_in = open(template_path, "r")
     fid_out = open(output_path, "w")
@@ -690,7 +728,7 @@ def write_slurm_script(slurm_conf: SlurmConfig, dir_mgr: SlurmDirectoryManager) 
         tline = tline.replace("%%pythonpath%%", dir_mgr.get_py_path())
 
         tline = tline.replace("%%python_script%%", exp_main_file)
-        tline = tline.replace("%%path_to_yaml_config%%", conf.config_path)
+        tline = tline.replace("%%path_to_yaml_config%%", config_exec_path)
 
         tline = tline.replace("%%cw_args%%", sc[SKEYS.CW_ARGS])
         tline = tline.replace("%%sbatch_args%%", sc[SKEYS.SBATCH_ARGS])
