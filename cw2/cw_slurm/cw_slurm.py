@@ -631,6 +631,26 @@ class SlurmDirectoryManager:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
 
+    def freeze_slurm_script(self, script_path: str):
+        """Store this submission's sbatch script inside CODE_COPY for exact resubmission."""
+        if self.m in [self.MODE_NOCOPY, self.MODE_ZIP]:
+            return
+
+        if self.m == self.MODE_COPY:
+            frozen_script_path = os.path.join(
+                os.path.abspath(self.get_exp_dst()), "sbatch.sh"
+            )
+            self._copy_runtime_config(script_path, frozen_script_path)
+            return
+
+        if self.m == self.MODE_MULTI:
+            dst_base = os.path.abspath(self.get_exp_dst())
+            for idx in range(self.slurm_config.slurm_conf[SKEYS.LAST_IDX] + 1):
+                self._copy_runtime_config(
+                    script_path,
+                    os.path.join(dst_base, str(idx), "sbatch.sh"),
+                )
+
     def get_py_path(self) -> str:
         """computes a modified python path, depending on the experiment_copy procedure
 
@@ -738,4 +758,5 @@ def write_slurm_script(slurm_conf: SlurmConfig, dir_mgr: SlurmDirectoryManager) 
         tline = fid_in.readline()
     fid_in.close()
     fid_out.close()
+    dir_mgr.freeze_slurm_script(output_path)
     return output_path
