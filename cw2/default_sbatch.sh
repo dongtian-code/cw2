@@ -20,6 +20,10 @@
 # Activate the virtualenv / conda environment
 %%venv%%
 
+# Make pip-installed CUDA split libraries visible to PyTorch in batch jobs.
+if [ -n "$CONDA_PREFIX" ]; then
+    export LD_LIBRARY_PATH="$CONDA_PREFIX/lib/python3.11/site-packages/nvidia/cudnn/lib:$CONDA_PREFIX/lib/python3.11/site-packages/nvidia/cublas/lib:$CONDA_PREFIX/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib:$LD_LIBRARY_PATH"
+fi
 
 # Export Pythonpath
 %%pythonpath%%
