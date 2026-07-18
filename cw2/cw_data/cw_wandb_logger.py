@@ -122,9 +122,6 @@ class WandBLogger(cw_logging.AbstractLogger):
             os.environ["WANDB_CACHE_DIR"] = self.wandb_cache_dir
         # Get the model logging directory
         self.wandb_log_model = self.config.get("log_model", False)
-        self.wandb_log_checkpoint_state = self.config.get(
-            "log_checkpoint_state", True
-        )
         self.model_artifact_exclude = set(
             self.config.get("model_artifact_exclude", [])
         )
@@ -348,11 +345,8 @@ class WandBLogger(cw_logging.AbstractLogger):
         if base_name.endswith(".tmp") or ".tmp." in base_name:
             return False
         if (
-                not self.wandb_log_checkpoint_state
-                and (
-                    base_name == "checkpoint_state"
-                    or base_name.startswith("checkpoint_state_")
-                )
+            base_name == "checkpoint_state"
+            or base_name.startswith("checkpoint_state_")
         ):
             return False
         return True
