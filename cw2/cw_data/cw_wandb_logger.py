@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import subprocess
 import warnings
 from random import random
 from time import sleep
@@ -122,6 +124,13 @@ class WandBLogger(cw_logging.AbstractLogger):
             os.environ["WANDB_CACHE_DIR"] = self.wandb_cache_dir
         # Get the model logging directory
         self.wandb_log_model = self.config.get("log_model", False)
+        self.sync_on_finish = bool(self.config.get("sync_on_finish", False))
+        sync_timeout = self.config.get("sync_on_finish_timeout", 600)
+        self.sync_on_finish_timeout = (
+            None
+            if sync_timeout is None or float(sync_timeout) <= 0
+            else float(sync_timeout)
+        )
         self.model_artifact_exclude = set(
             self.config.get("model_artifact_exclude", [])
         )
@@ -237,9 +246,81 @@ class WandBLogger(cw_logging.AbstractLogger):
 
     def finalize(self) -> None:
         if self.run is not None:
-            self.write_wandb_metadata()
-            self.log_model()
-            self.run.finish()
+            run_dir = self._local_run_dir()
+            run_id = getattr(self.run, "id", None)
+            for operation_name, operation in (
+                ("metadata update", self.write_wandb_metadata),
+                ("model artifact upload", self.log_model),
+                ("run finish", self.run.finish),
+            ):
+                try:
+                    operation()
+                except Exception as error:
+                    warnings.warn(
+                        f"W&B {operation_name} failed during finalization: {error}"
+                    )
+
+            if self.sync_on_finish:
+                self._sync_local_run(run_dir=run_dir, run_id=run_id)
+
+    def _local_run_dir(self):
+        run_files_dir = getattr(self.run, "dir", None)
+        if not run_files_dir:
+            return None
+        run_files_dir = os.path.abspath(run_files_dir)
+        if os.path.basename(run_files_dir) == "files":
+            return os.path.dirname(run_files_dir)
+        return run_files_dir
+
+    def _sync_local_run(self, run_dir, run_id=None):
+        if run_dir is None or not os.path.isdir(run_dir):
+            warnings.warn(
+                "W&B completion sync was requested, but the local run directory "
+                f"is unavailable: {run_dir}"
+            )
+            return
+
+        wandb_executable = shutil.which("wandb")
+        if wandb_executable is None:
+            warnings.warn(
+                "W&B completion sync was requested, but the wandb executable "
+                "was not found."
+            )
+            return
+
+        command = [
+            wandb_executable,
+            "sync",
+            "--include-online",
+            "--include-synced",
+            "--no-sync-tensorboard",
+            "--append",
+        ]
+        if run_id:
+            command.extend(["--id", str(run_id)])
+        command.append(run_dir)
+
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.sync_on_finish_timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            warnings.warn(f"W&B completion sync failed: {error}")
+            return
+
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "").strip()
+            warnings.warn(
+                "W&B completion sync exited with code "
+                f"{result.returncode}: {details}"
+            )
+            return
+
+        print(f"[wandb] Completion sync succeeded: {run_dir}", flush=True)
 
     def _git_metadata_payload(self):
         git_repos = self.cw2_config.get("git_repos")
