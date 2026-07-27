@@ -2,6 +2,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -819,6 +820,115 @@ def query_idle_auto_gpu_nodes(
     return idle_counts
 
 
+def _constraint_has_feature(constraint: str, feature: str) -> bool:
+    feature_pattern = r"(?<![A-Za-z0-9_.-]){}(?![A-Za-z0-9_.-])"
+    return re.search(feature_pattern.format(re.escape(feature)), constraint) is not None
+
+
+def _pending_constraint_matches_models(
+    constraint: str,
+    gpu_models: list,
+) -> bool:
+    if not gpu_models:
+        return True
+    if any(
+        _constraint_has_feature(constraint, model)
+        for model in gpu_models
+    ):
+        return True
+
+    # Auto-generated constraints put the accepted GPU models immediately
+    # after GPUxN. A disjoint group cannot consume one of our eligible nodes.
+    model_group = re.search(
+        r"GPUx\d+\s*&\s*\(([^)]*)\)",
+        constraint,
+    )
+    return model_group is None
+
+
+def query_pending_priority_auto_gpu_demand(
+    conf: cw_config.Config,
+    node_counts: list,
+    gpu_models: list,
+):
+    partition = conf.slurm_config.get("partition")
+    if not partition:
+        raise cw_error.ConfigKeyError(
+            "num_gpus=auto requires a Slurm partition."
+        )
+
+    delimiter = "\t"
+    command = [
+        "squeue",
+        "-r",
+        "-h",
+        "-p",
+        partition,
+        "-t",
+        "PENDING",
+        "-o",
+        delimiter.join(["%D", "%f", "%r", "%Q"]),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        raise cw_error.ConfigKeyError(
+            "num_gpus=auto could not inspect pending Slurm jobs with: {}."
+            .format(" ".join(command))
+        ) from exc
+
+    pending_counts = {count: 0 for count in node_counts}
+    allowed_counts = set(node_counts)
+    for line in result.stdout.splitlines():
+        fields = line.split(delimiter)
+        if len(fields) != 4:
+            raise cw_error.ConfigKeyError(
+                "Could not parse pending Slurm job data: {!r}.".format(line)
+            )
+        raw_nodes, constraint, reason, _priority = (
+            field.strip() for field in fields
+        )
+        if reason.lower() != "priority":
+            continue
+
+        gpu_count_match = re.search(
+            r"(?<![A-Za-z0-9_.-])GPUx(\d+)(?![A-Za-z0-9_.-])",
+            constraint,
+        )
+        if gpu_count_match is None:
+            continue
+        gpu_count = int(gpu_count_match.group(1))
+        if gpu_count not in allowed_counts:
+            continue
+        if not _pending_constraint_matches_models(constraint, gpu_models):
+            continue
+
+        try:
+            requested_nodes = int(raw_nodes)
+        except ValueError as exc:
+            raise cw_error.ConfigKeyError(
+                "Could not parse pending Slurm node count {!r}."
+                .format(raw_nodes)
+            ) from exc
+        if requested_nodes < 1:
+            raise cw_error.ConfigKeyError(
+                "Pending Slurm node count must be positive, got {}."
+                .format(requested_nodes)
+            )
+        pending_counts[gpu_count] += requested_nodes
+    return pending_counts
+
+
 def _eligible_auto_gpu_counts(
     cw_job,
     reps_per_gpu: int,
@@ -892,6 +1002,7 @@ def resolve_auto_gpu_resources(
     conf: cw_config.Config,
     jobs: list,
     idle_node_counts=None,
+    pending_node_counts=None,
 ):
     configured_num_gpus = conf.slurm_config.get("num_gpus", 0)
     if not (
@@ -911,14 +1022,15 @@ def resolve_auto_gpu_resources(
         _eligible_auto_gpu_counts(cw_job, reps_per_gpu, node_counts)
         for cw_job in jobs
     ]
-    if idle_node_counts is None:
+    queried_idle_nodes = idle_node_counts is None
+    if queried_idle_nodes:
         idle_node_counts = query_idle_auto_gpu_nodes(
             conf,
             node_counts,
             gpu_models,
         )
     try:
-        available_by_count = {
+        idle_by_count = {
             count: max(0, int(idle_node_counts.get(count, 0)))
             for count in node_counts
         }
@@ -926,6 +1038,39 @@ def resolve_auto_gpu_resources(
         raise cw_error.ConfigKeyError(
             "idle_node_counts must map GPU node sizes to non-negative counts."
         ) from exc
+
+    subtract_pending = conf.slurm_config.get(
+        "auto_gpu_subtract_pending_priority",
+        False,
+    )
+    if not isinstance(subtract_pending, bool):
+        raise cw_error.ConfigKeyError(
+            "auto_gpu_subtract_pending_priority must be true or false."
+        )
+    if subtract_pending and pending_node_counts is None and queried_idle_nodes:
+        pending_node_counts = query_pending_priority_auto_gpu_demand(
+            conf,
+            node_counts,
+            gpu_models,
+        )
+    if pending_node_counts is None:
+        pending_node_counts = {}
+    try:
+        pending_by_count = {
+            count: max(0, int(pending_node_counts.get(count, 0)))
+            if subtract_pending
+            else 0
+            for count in node_counts
+        }
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise cw_error.ConfigKeyError(
+            "pending_node_counts must map GPU node sizes to non-negative "
+            "counts."
+        ) from exc
+    available_by_count = {
+        count: max(0, idle_by_count[count] - pending_by_count[count])
+        for count in node_counts
+    }
 
     remaining = list(range(len(jobs)))
     assignment = {count: [] for count in node_counts}
@@ -968,8 +1113,17 @@ def resolve_auto_gpu_resources(
     }
     print(
         "[slurm] Idle GPU nodes matching configured models: {}."
-        .format(available_by_count)
+        .format(idle_by_count)
     )
+    if subtract_pending:
+        print(
+            "[slurm] Pending Priority GPU demand reserved before submission: "
+            "{}.".format(pending_by_count)
+        )
+        print(
+            "[slurm] Effective idle GPU nodes after pending-demand "
+            "subtraction: {}.".format(available_by_count)
+        )
     for gpu_count in sorted(assignment, reverse=True):
         print(
             "[slurm] GPUx{}: {} array task(s), global indices {}.".format(

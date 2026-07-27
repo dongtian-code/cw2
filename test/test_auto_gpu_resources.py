@@ -24,6 +24,7 @@ def _config(
             "auto_gpu_node_counts": list(node_counts),
             "auto_gpu_models": ["H100", "A100"],
             "auto_gpu_fallback_count": fallback_count,
+            "auto_gpu_subtract_pending_priority": True,
             "num_parallel_jobs": 120,
             "partition": "allgpu",
             "cpus-per-task": 64,
@@ -118,7 +119,7 @@ def test_idle_node_query_filters_gpu_models(monkeypatch):
             stdout="\n".join(
                 [
                     "GPUx4,H100",
-                    "GPUx4,V100",
+                    "GPUx4,MI250",
                     "GPUx2,A100",
                     "GPUx1,H100",
                     "GPUx2,H100",
@@ -132,6 +133,66 @@ def test_idle_node_query_filters_gpu_models(monkeypatch):
         [1, 2, 4],
         ["H100", "A100"],
     ) == {1: 1, 2: 2, 4: 1}
+
+
+def test_pending_priority_query_expands_arrays_and_filters_jobs(monkeypatch):
+    conf = _config()
+    observed_command = []
+
+    def fake_run(command, **_kwargs):
+        observed_command.extend(command)
+        return SimpleNamespace(
+            stdout="\n".join(
+                [
+                    "1\tGPUx4&(H100|A100)\tPriority\t1000",
+                    "1\tGPUx4&(MI250)\tPriority\t1200",
+                    "2\tGPUx2&(H100)\tPriority\t1100",
+                    "1\tGPUx2&(A100)\tResources\t900",
+                    "1\tGPUx1\tPriority\t800",
+                    "1\tH100\tPriority\t700",
+                ]
+            )
+        )
+
+    monkeypatch.setattr(cw_slurm.subprocess, "run", fake_run)
+
+    assert cw_slurm.query_pending_priority_auto_gpu_demand(
+        conf,
+        [1, 2, 4],
+        ["H100", "A100"],
+    ) == {1: 1, 2: 2, 4: 1}
+    assert "-r" in observed_command
+
+
+def test_auto_gpu_assignment_subtracts_pending_priority_demand():
+    conf = _config()
+    jobs = [_job(4) for _ in range(6)]
+
+    assignment = cw_slurm.resolve_auto_gpu_resources(
+        conf,
+        jobs,
+        idle_node_counts={4: 2, 2: 4, 1: 1},
+        pending_node_counts={4: 2, 2: 0, 1: 0},
+    )
+
+    assert assignment == {
+        2: [0, 1, 2, 3, 5],
+        1: [4],
+    }
+
+
+def test_auto_gpu_assignment_can_disable_pending_subtraction():
+    conf = _config()
+    conf.slurm_config["auto_gpu_subtract_pending_priority"] = False
+
+    assignment = cw_slurm.resolve_auto_gpu_resources(
+        conf,
+        [_job(4)],
+        idle_node_counts={4: 1, 2: 0, 1: 0},
+        pending_node_counts={4: 1, 2: 0, 1: 0},
+    )
+
+    assert assignment == {4: [0]}
 
 
 def test_auto_gpu_submission_keeps_global_array_indices(monkeypatch):
