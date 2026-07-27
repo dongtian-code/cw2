@@ -137,12 +137,14 @@ class JobFactory:
         delete_old_files: bool = False,
         root_dir: str = "",
         read_only: bool = False,
+        job_capacities=None,
     ):
         self.exp_cls = exp_cls
         self.logger = logger
         self.delete_old_files = delete_old_files
         self.root_dir = root_dir
         self.read_only = read_only
+        self.job_capacities = job_capacities
 
     def _group_exp_tasks(self, task_confs: List[Dict]) -> Dict:
         """group tasks by experiment to access common attributes like reps_per_job
@@ -172,6 +174,9 @@ class JobFactory:
             List[List[attrdict.AttrDict]]: a list containing all subpackages of tasks as lists
         """
         grouped_exps = self._group_exp_tasks(task_confs)
+        if self.job_capacities is not None:
+            return self._divide_tasks_by_capacities(grouped_exps)
+
         tasks = []
 
         for exp_name in grouped_exps:
@@ -186,6 +191,54 @@ class JobFactory:
 
             for start_rep in range(0, max_rep, rep_portion):
                 tasks.append(exp_group[start_rep : start_rep + rep_portion])
+        return tasks
+
+    def _divide_tasks_by_capacities(
+        self,
+        grouped_exps: Dict[str, List[Dict]],
+    ) -> List[List[Dict]]:
+        try:
+            capacities = [int(value) for value in self.job_capacities]
+        except (TypeError, ValueError) as exc:
+            raise cw_error.ConfigKeyError(
+                "auto_gpu_job_capacities must be a list of positive integers."
+            ) from exc
+        if not capacities or any(value < 1 for value in capacities):
+            raise cw_error.ConfigKeyError(
+                "auto_gpu_job_capacities must be a non-empty list of "
+                "positive integers."
+            )
+
+        tasks = []
+        capacity_idx = 0
+        for exp_group in grouped_exps.values():
+            task_idx = 0
+            while task_idx < len(exp_group):
+                if capacity_idx >= len(capacities):
+                    raise cw_error.ConfigKeyError(
+                        "auto_gpu_job_capacities does not cover every "
+                        "expanded experiment run."
+                    )
+                capacity = capacities[capacity_idx]
+                task_end = task_idx + capacity
+                if task_end > len(exp_group):
+                    raise cw_error.ConfigKeyError(
+                        "auto_gpu_job_capacities crosses an experiment-group "
+                        "boundary."
+                    )
+                task_group = exp_group[task_idx:task_end]
+                for task_config in task_group:
+                    task_config[KEYS.REPS_P_JOB] = capacity
+                    task_config[KEYS.REPS_PARALL] = capacity
+                tasks.append(task_group)
+                task_idx = task_end
+                capacity_idx += 1
+
+        if capacity_idx != len(capacities):
+            raise cw_error.ConfigKeyError(
+                "auto_gpu_job_capacities contains more entries than expanded "
+                "experiment runs require."
+            )
         return tasks
 
     def create_jobs(self, exp_configs: List[Dict]) -> List[Job]:

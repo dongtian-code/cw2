@@ -968,11 +968,7 @@ def _auto_cpus_per_rep(
             )
         return cpus_per_rep
 
-    max_concurrent_reps = max(
-        max(_eligible_auto_gpu_counts(job, reps_per_gpu, node_counts))
-        * reps_per_gpu
-        for job in jobs
-    )
+    max_concurrent_reps = max(node_counts) * reps_per_gpu
     configured_cpus = int(conf.slurm_config["cpus-per-task"])
     if configured_cpus < max_concurrent_reps:
         raise cw_error.ConfigKeyError(
@@ -1003,6 +999,7 @@ def resolve_auto_gpu_resources(
     jobs: list,
     idle_node_counts=None,
     pending_node_counts=None,
+    return_job_capacities=False,
 ):
     configured_num_gpus = conf.slurm_config.get("num_gpus", 0)
     if not (
@@ -1018,10 +1015,17 @@ def resolve_auto_gpu_resources(
     reps_per_gpu, node_counts, gpu_models, fallback_count = (
         _auto_gpu_settings(conf)
     )
-    eligible_by_job = [
-        _eligible_auto_gpu_counts(cw_job, reps_per_gpu, node_counts)
-        for cw_job in jobs
-    ]
+    grouped_task_counts = {}
+    for cw_job in jobs:
+        for task in cw_job.tasks:
+            task_name = (
+                task.get(CKEYS.NAME, "__auto_gpu_default__")
+                if hasattr(task, "get")
+                else "__auto_gpu_default__"
+            )
+            grouped_task_counts[task_name] = (
+                grouped_task_counts.get(task_name, 0) + 1
+            )
     queried_idle_nodes = idle_node_counts is None
     if queried_idle_nodes:
         idle_node_counts = query_idle_auto_gpu_nodes(
@@ -1071,40 +1075,49 @@ def resolve_auto_gpu_resources(
         count: max(0, idle_by_count[count] - pending_by_count[count])
         for count in node_counts
     }
+    remaining_idle_by_count = dict(available_by_count)
 
-    remaining = list(range(len(jobs)))
     assignment = {count: [] for count in node_counts}
-    for gpu_count in sorted(node_counts, reverse=True):
-        available = available_by_count[gpu_count]
-        if available == 0:
-            continue
-        eligible_jobs = [
-            job_idx
-            for job_idx in remaining
-            if gpu_count in eligible_by_job[job_idx]
-        ]
-        selected_jobs = eligible_jobs[:available]
-        assignment[gpu_count].extend(selected_jobs)
-        selected_set = set(selected_jobs)
-        remaining = [
-            job_idx
-            for job_idx in remaining
-            if job_idx not in selected_set
-        ]
+    job_capacities = []
 
-    for job_idx in remaining:
-        eligible_counts = eligible_by_job[job_idx]
-        fallback_candidates = [
-            count
-            for count in eligible_counts
-            if count <= fallback_count
-        ]
-        selected_count = (
-            max(fallback_candidates)
-            if fallback_candidates
-            else min(eligible_counts)
-        )
-        assignment[selected_count].append(job_idx)
+    def add_jobs(gpu_count, number_of_jobs):
+        capacity = gpu_count * reps_per_gpu
+        for _ in range(number_of_jobs):
+            job_idx = len(job_capacities)
+            job_capacities.append(capacity)
+            assignment[gpu_count].append(job_idx)
+
+    for task_count in grouped_task_counts.values():
+        remaining_tasks = task_count
+        for gpu_count in sorted(node_counts, reverse=True):
+            capacity = gpu_count * reps_per_gpu
+            number_of_jobs = min(
+                remaining_idle_by_count[gpu_count],
+                remaining_tasks // capacity,
+            )
+            add_jobs(gpu_count, number_of_jobs)
+            remaining_idle_by_count[gpu_count] -= number_of_jobs
+            remaining_tasks -= number_of_jobs * capacity
+
+        while remaining_tasks > 0:
+            fallback_candidates = [
+                count
+                for count in node_counts
+                if count <= fallback_count
+                and count * reps_per_gpu <= remaining_tasks
+            ]
+            if not fallback_candidates:
+                raise cw_error.ConfigKeyError(
+                    "Expanded experiment group with {} run(s) cannot fully "
+                    "occupy any configured GPU node with reps_per_gpu={}. "
+                    "Adjust repetitions or reps_per_gpu.".format(
+                        task_count,
+                        reps_per_gpu,
+                    )
+                )
+            selected_count = max(fallback_candidates)
+            add_jobs(selected_count, 1)
+            remaining_tasks -= selected_count * reps_per_gpu
 
     assignment = {
         count: indices
@@ -1126,34 +1139,22 @@ def resolve_auto_gpu_resources(
         )
     for gpu_count in sorted(assignment, reverse=True):
         print(
-            "[slurm] GPUx{}: {} array task(s), global indices {}.".format(
+            "[slurm] GPUx{}: {} array task(s), {} run(s) per task, global "
+            "indices {}.".format(
                 gpu_count,
                 len(assignment[gpu_count]),
+                gpu_count * reps_per_gpu,
                 _compress_array_indices(assignment[gpu_count]),
             )
         )
+    if return_job_capacities:
+        return assignment, job_capacities
     return assignment
 
 
 def _auto_gpu_base_count(conf: cw_config.Config, jobs: list) -> int:
-    reps_per_gpu, node_counts, _, fallback_count = (
-        _auto_gpu_settings(conf)
-    )
-    common_counts = set(node_counts)
-    for cw_job in jobs:
-        common_counts.intersection_update(
-            _eligible_auto_gpu_counts(cw_job, reps_per_gpu, node_counts)
-        )
-    preferred_counts = [
-        count for count in common_counts if count <= fallback_count
-    ]
-    if not preferred_counts:
-        preferred_counts = sorted(common_counts)
-    if not preferred_counts:
-        raise cw_error.ConfigKeyError(
-            "No common fallback GPU node size can run every Slurm array task."
-        )
-    return max(preferred_counts)
+    _, _, _, fallback_count = _auto_gpu_settings(conf)
+    return fallback_count
 
 
 def _compress_array_indices(indices: list) -> str:
@@ -1266,8 +1267,17 @@ def run_slurm(conf: cw_config.Config, jobs) -> None:
         num_jobs = jobs
     else:
         num_jobs = len(jobs)
-        auto_gpu_assignment = resolve_auto_gpu_resources(conf, jobs)
+        auto_gpu_plan = resolve_auto_gpu_resources(
+            conf,
+            jobs,
+            return_job_capacities=True,
+        )
+        auto_gpu_assignment = (
+            auto_gpu_plan[0] if auto_gpu_plan is not None else None
+        )
         if auto_gpu_assignment is not None:
+            auto_job_capacities = auto_gpu_plan[1]
+            num_jobs = len(auto_job_capacities)
             (
                 auto_reps_per_gpu,
                 auto_node_counts,
@@ -1292,6 +1302,10 @@ def run_slurm(conf: cw_config.Config, jobs) -> None:
                 auto_reps_per_gpu,
                 auto_cpus_per_rep,
             )
+            conf.slurm_config["auto_gpu_job_capacities"] = (
+                auto_job_capacities
+            )
+            conf.to_yaml(relpath=True)
 
     # Finalize Configs
     sc = SlurmConfig(conf)

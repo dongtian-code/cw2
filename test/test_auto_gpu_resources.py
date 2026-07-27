@@ -4,6 +4,8 @@ import pytest
 
 from cw2 import cw_error
 from cw2 import scheduler as scheduler_module
+from cw2 import job as job_module
+from cw2.cw_config import cw_conf_keys as config_keys
 from cw2.cw_slurm import cw_slurm
 from cw2.scheduler import (
     GPUDistributingLocalScheduler,
@@ -54,8 +56,8 @@ def test_auto_gpu_assignment_uses_only_current_idle_nodes_then_fallback():
 
     assert assignment == {
         4: [0, 1],
-        2: [2, 3, 4, 6, 7, 8],
-        1: [5],
+        2: [2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        1: [5, 16],
     }
 
 
@@ -70,13 +72,13 @@ def test_auto_gpu_assignment_respects_reps_per_gpu():
     )
 
     assert assignment == {
-        4: [1],
-        2: [0],
+        4: [0],
+        2: [1],
         1: [2],
     }
 
 
-def test_auto_gpu_assignment_respects_reps_in_parallel():
+def test_auto_gpu_assignment_replaces_static_reps_in_parallel():
     conf = _config()
     jobs = [_job(task_count=4, n_parallel=2)]
 
@@ -86,13 +88,13 @@ def test_auto_gpu_assignment_respects_reps_in_parallel():
         idle_node_counts={4: 1, 2: 1, 1: 1},
     )
 
-    assert assignment == {2: [0]}
+    assert assignment == {4: [0]}
 
 
 def test_auto_gpu_count_rejects_node_that_cannot_be_filled():
     conf = _config(reps_per_gpu=2)
 
-    with pytest.raises(cw_error.ConfigKeyError, match="fully occupied"):
+    with pytest.raises(cw_error.ConfigKeyError, match="cannot fully occupy"):
         cw_slurm.resolve_auto_gpu_resources(
             conf,
             [_job(1)],
@@ -176,8 +178,8 @@ def test_auto_gpu_assignment_subtracts_pending_priority_demand():
     )
 
     assert assignment == {
-        2: [0, 1, 2, 3, 5],
-        1: [4],
+        2: [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
+        1: [4, 12],
     }
 
 
@@ -193,6 +195,55 @@ def test_auto_gpu_assignment_can_disable_pending_subtraction():
     )
 
     assert assignment == {4: [0]}
+
+
+def test_auto_gpu_job_capacities_cover_every_run_exactly():
+    conf = _config()
+
+    assignment, capacities = cw_slurm.resolve_auto_gpu_resources(
+        conf,
+        [_job(100)],
+        idle_node_counts={4: 1, 2: 17, 1: 9},
+        pending_node_counts={4: 2, 2: 0, 1: 0},
+        return_job_capacities=True,
+    )
+
+    assert len(assignment[2]) == 45
+    assert len(assignment[1]) == 10
+    assert 4 not in assignment
+    assert sum(capacities) == 100
+    assert all(
+        capacities[job_idx] == gpu_count
+        for gpu_count, job_indices in assignment.items()
+        for job_idx in job_indices
+    )
+
+
+def test_job_factory_applies_dynamic_reps_per_job_and_parallelism():
+    tasks = [
+        {
+            config_keys.NAME: "experiment",
+            config_keys.REPS_P_JOB: 4,
+            config_keys.REPS_PARALL: 4,
+        }
+        for _ in range(7)
+    ]
+    factory = job_module.JobFactory(
+        exp_cls=None,
+        logger=None,
+        read_only=True,
+        job_capacities=[4, 2, 1],
+    )
+
+    divided = factory._divide_tasks(tasks)
+
+    assert [len(group) for group in divided] == [4, 2, 1]
+    for group, capacity in zip(divided, [4, 2, 1]):
+        assert all(
+            task[config_keys.REPS_P_JOB] == capacity
+            and task[config_keys.REPS_PARALL] == capacity
+            for task in group
+        )
 
 
 def test_auto_gpu_submission_keeps_global_array_indices(monkeypatch):

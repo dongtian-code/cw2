@@ -44,8 +44,18 @@ class ClusterWork:
             List[job.Job]: list of all configured job objects
         """
         if self.joblist is None:
+            job_capacities = None
+            if self.config.slurm_config is not None:
+                job_capacities = self.config.slurm_config.get(
+                    "auto_gpu_job_capacities"
+                )
             factory = job.JobFactory(
-                self.exp_cls, self.logArray, delete, root_dir, read_only
+                self.exp_cls,
+                self.logArray,
+                delete,
+                root_dir,
+                read_only,
+                job_capacities=job_capacities,
             )
             self.joblist = factory.create_jobs(self.config.exp_configs)
         return self.joblist
