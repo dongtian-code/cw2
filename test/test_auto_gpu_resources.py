@@ -3,9 +3,11 @@ from types import SimpleNamespace
 import pytest
 
 from cw2 import cw_error
+from cw2 import scheduler as scheduler_module
 from cw2.cw_slurm import cw_slurm
 from cw2.scheduler import (
     GPUDistributingLocalScheduler,
+    HOREKAAffinityGPUDistributingLocalScheduler,
     MPGPUDistributingLocalScheduler,
 )
 
@@ -24,6 +26,9 @@ def _config(
             "auto_gpu_fallback_count": fallback_count,
             "num_parallel_jobs": 120,
             "partition": "allgpu",
+            "cpus-per-task": 64,
+            "cpus_per_rep": 16,
+            "ntasks": 1,
             "sbatch_args": {},
         }
     )
@@ -140,31 +145,70 @@ def test_auto_gpu_submission_keeps_global_array_indices(monkeypatch):
         lambda command: submitted.append(command),
     )
 
-    cw_slurm._submit_auto_gpu_arrays(conf, assignment, "/tmp/sbatch.sh")
+    cw_slurm._submit_auto_gpu_arrays(
+        conf,
+        assignment,
+        "/tmp/sbatch.sh",
+        ["H100", "A100"],
+        reps_per_gpu=1,
+        cpus_per_rep=16,
+    )
 
     assert submitted == [
         [
             "sbatch",
             "--array=0-1%2",
             "--constraint=GPUx4&(H100|A100)",
-            "--export=ALL,MPRL_RESUBMIT_CONSTRAINT=GPUx4&(H100|A100)",
+            "--cpus-per-task=64",
+            (
+                "--export=ALL,MPRL_RESUBMIT_CONSTRAINT=GPUx4&(H100|A100),"
+                "MPRL_RESUBMIT_CPUS_PER_TASK=64"
+            ),
             "/tmp/sbatch.sh",
         ],
         [
             "sbatch",
             "--array=2-3,6%3",
             "--constraint=GPUx2&(H100|A100)",
-            "--export=ALL,MPRL_RESUBMIT_CONSTRAINT=GPUx2&(H100|A100)",
+            "--cpus-per-task=32",
+            (
+                "--export=ALL,MPRL_RESUBMIT_CONSTRAINT=GPUx2&(H100|A100),"
+                "MPRL_RESUBMIT_CPUS_PER_TASK=32"
+            ),
             "/tmp/sbatch.sh",
         ],
         [
             "sbatch",
             "--array=4-5%2",
             "--constraint=GPUx1&(H100|A100)",
-            "--export=ALL,MPRL_RESUBMIT_CONSTRAINT=GPUx1&(H100|A100)",
+            "--cpus-per-task=16",
+            (
+                "--export=ALL,MPRL_RESUBMIT_CONSTRAINT=GPUx1&(H100|A100),"
+                "MPRL_RESUBMIT_CPUS_PER_TASK=16"
+            ),
             "/tmp/sbatch.sh",
         ],
     ]
+
+
+def test_auto_cpu_request_respects_reps_per_gpu():
+    assert cw_slurm._auto_cpus_per_task(
+        gpu_count=2,
+        reps_per_gpu=2,
+        cpus_per_rep=16,
+    ) == 64
+
+
+def test_auto_cpu_per_rep_can_be_inferred_from_legacy_config():
+    conf = _config()
+    del conf.slurm_config["cpus_per_rep"]
+
+    assert cw_slurm._auto_cpus_per_rep(
+        conf,
+        [_job(4)],
+        reps_per_gpu=1,
+        node_counts=[1, 2, 4],
+    ) == 16
 
 
 def test_auto_gpu_group_throttles_preserve_global_limit():
@@ -217,3 +261,21 @@ def test_auto_runtime_parallelism_fails_if_node_cannot_be_filled():
 
     with pytest.raises(RuntimeError, match="contains only 2 runs"):
         scheduler._gpu_num_parallel()
+
+
+def test_horeka_scheduler_honors_explicit_cpus_per_rep(monkeypatch):
+    conf = _config()
+    conf.slurm_config["auto_gpu_node_counts"] = [1, 2]
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setattr(
+        scheduler_module.os,
+        "sched_getaffinity",
+        lambda _pid: set(range(32)),
+        raising=False,
+    )
+
+    scheduler = HOREKAAffinityGPUDistributingLocalScheduler(conf)
+
+    assert scheduler._queue_elements == 2
+    assert scheduler._cpus_per_rep == 16
+    assert scheduler._usable_cpus == list(range(32))

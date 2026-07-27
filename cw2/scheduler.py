@@ -338,11 +338,34 @@ class HOREKAAffinityGPUDistributingLocalScheduler(GPUDistributingLocalScheduler)
     def __init__(self, conf: cw_config.Config = None):
         super(HOREKAAffinityGPUDistributingLocalScheduler, self).__init__(conf=conf)
 
-        total_cpus = conf.slurm_config["cpus-per-task"] * conf.slurm_config["ntasks"]
         self._allowed_cpus = sorted(os.sched_getaffinity(0))
-        usable_cpu_count = min(total_cpus, len(self._allowed_cpus))
-        self._usable_cpus = self._allowed_cpus[:usable_cpu_count]
-        self._cpus_per_rep = usable_cpu_count // self._queue_elements
+        configured_cpus_per_rep = conf.slurm_config.get("cpus_per_rep")
+        if configured_cpus_per_rep is not None:
+            self._cpus_per_rep = int(configured_cpus_per_rep)
+            assert (
+                self._cpus_per_rep > 0
+                and self._cpus_per_rep == configured_cpus_per_rep
+            ), "cpus_per_rep must be a positive integer"
+            required_cpu_count = self._cpus_per_rep * self._queue_elements
+            assert required_cpu_count <= len(self._allowed_cpus), (
+                "Slurm allocated {} CPUs, but {} GPUs x {} reps_per_gpu x "
+                "{} cpus_per_rep requires {} CPUs.".format(
+                    len(self._allowed_cpus),
+                    self._total_num_gpus,
+                    self._reps_per_gpu,
+                    self._cpus_per_rep,
+                    required_cpu_count,
+                )
+            )
+            self._usable_cpus = self._allowed_cpus[:required_cpu_count]
+        else:
+            total_cpus = (
+                conf.slurm_config["cpus-per-task"]
+                * conf.slurm_config["ntasks"]
+            )
+            usable_cpu_count = min(total_cpus, len(self._allowed_cpus))
+            self._usable_cpus = self._allowed_cpus[:usable_cpu_count]
+            self._cpus_per_rep = usable_cpu_count // self._queue_elements
 
         assert (
             self._cpus_per_rep > 0
