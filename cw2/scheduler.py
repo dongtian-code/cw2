@@ -4,6 +4,7 @@ import concurrent.futures
 import multiprocessing
 import signal
 import socket
+import subprocess
 import warnings
 import math
 from typing import List
@@ -42,6 +43,9 @@ class AbstractScheduler(abc.ABC):
 class GPUDistributingLocalScheduler(AbstractScheduler):
     def __init__(self, conf: cw_config.Config = None):
         super(GPUDistributingLocalScheduler, self).__init__(conf=conf)
+        self._auto_num_gpus = self.is_auto_gpu_count(
+            conf.slurm_config.get("num_gpus", 0)
+        )
         self._total_num_gpus = self.get_num_requested_gpus(conf)
         self._reps_per_gpu = int(conf.slurm_config.get("reps_per_gpu", 1))
         assert self._reps_per_gpu >= 1, "reps_per_gpu must be >= 1"
@@ -94,7 +98,87 @@ class GPUDistributingLocalScheduler(AbstractScheduler):
         sbatch_args = conf.slurm_config.get("sbatch_args", {})
         if isinstance(sbatch_args, dict) and "gres" in sbatch_args:
             return int(str(sbatch_args["gres"]).rsplit(":", 1)[1])
-        return int(conf.slurm_config.get("num_gpus", 0))
+        configured_num_gpus = conf.slurm_config.get("num_gpus", 0)
+        if GPUDistributingLocalScheduler.is_auto_gpu_count(configured_num_gpus):
+            return GPUDistributingLocalScheduler.detect_available_gpu_count()
+        return int(configured_num_gpus)
+
+    @staticmethod
+    def is_auto_gpu_count(value) -> bool:
+        return isinstance(value, str) and value.strip().lower() == "auto"
+
+    @staticmethod
+    def detect_available_gpu_count() -> int:
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible_devices is not None:
+            visible_devices = visible_devices.strip()
+            if visible_devices in ("", "-1", "NoDevFiles"):
+                raise RuntimeError(
+                    "num_gpus=auto, but CUDA_VISIBLE_DEVICES exposes no GPUs."
+                )
+            return len(
+                [device for device in visible_devices.split(",") if device.strip()]
+            )
+
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index",
+                    "--format=csv,noheader",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            raise RuntimeError(
+                "num_gpus=auto could not detect GPUs. CUDA_VISIBLE_DEVICES is "
+                "unset and nvidia-smi did not return the node GPU list."
+            ) from exc
+
+        gpu_count = len(
+            [line for line in result.stdout.splitlines() if line.strip()]
+        )
+        if gpu_count < 1:
+            raise RuntimeError(
+                "num_gpus=auto detected zero GPUs from nvidia-smi."
+            )
+        return gpu_count
+
+    def _gpu_num_parallel(self) -> int:
+        if self._auto_num_gpus:
+            for j in self.joblist:
+                if len(j.tasks) < self._queue_elements:
+                    raise RuntimeError(
+                        "Auto GPU scheduling selected {} concurrent run slots, "
+                        "but a Slurm task contains only {} runs. Reduce the "
+                        "selected node GPU count or reps_per_gpu.".format(
+                            self._queue_elements,
+                            len(j.tasks),
+                        )
+                    )
+            print(
+                "Auto GPU scheduling: using {} worker processes from {} detected "
+                "GPUs and {} reps per GPU.".format(
+                    self._queue_elements,
+                    self._total_num_gpus,
+                    self._reps_per_gpu,
+                ),
+                flush=True,
+            )
+            return self._queue_elements
+
+        num_parallel = self.joblist[0].n_parallel
+        for j in self.joblist:
+            assert (
+                j.n_parallel == num_parallel
+            ), "All jobs in list must have same n_parallel"
+            assert j.n_parallel == self._queue_elements, (
+                "Mismatch between GPUs Queue Elements and Jobs executed in"
+                "parallel. Fix for optimal resource usage!!"
+            )
+        return num_parallel
 
     @staticmethod
     def use_distributed_gpu_scheduling(conf: cw_config.Config) -> bool:
@@ -205,15 +289,7 @@ class GPUDistributingLocalScheduler(AbstractScheduler):
 
 class MPGPUDistributingLocalScheduler(GPUDistributingLocalScheduler):
     def run(self, overwrite: bool = False):
-        num_parallel = self.joblist[0].n_parallel
-        for j in self.joblist:
-            assert (
-                j.n_parallel == num_parallel
-            ), "All jobs in list must have same n_parallel"
-            assert j.n_parallel == self._queue_elements, (
-                "Mismatch between GPUs Queue Elements and Jobs executed in"
-                "parallel. Fix for optimal resource usage!!"
-            )
+        num_parallel = self._gpu_num_parallel()
 
         active_pool = None
         previous_handlers = self._install_worker_signal_forwarding(
@@ -274,15 +350,7 @@ class HOREKAAffinityGPUDistributingLocalScheduler(GPUDistributingLocalScheduler)
 
     def run(self, overwrite: bool = False):
         print("Seeing CPUs:", os.sched_getaffinity(0), flush=True)
-        num_parallel = self.joblist[0].n_parallel
-        for j in self.joblist:
-            assert (
-                j.n_parallel == num_parallel
-            ), "All jobs in list must have same n_parallel"
-            assert j.n_parallel == self._queue_elements, (
-                "Mismatch between GPUs Queue Elements and Jobs executed in"
-                "parallel. Fix for optimal resource usage!!"
-            )
+        num_parallel = self._gpu_num_parallel()
 
         active_pool = None
         previous_handlers = self._install_worker_signal_forwarding(
@@ -357,15 +425,7 @@ class KlusterThreadLimitingScheduler(GPUDistributingLocalScheduler):
         print("Using {} threads per Rep".format(self._num_threads))
 
     def run(self, overwrite: bool = False):
-        num_parallel = self.joblist[0].n_parallel
-        for j in self.joblist:
-            assert (
-                j.n_parallel == num_parallel
-            ), "All jobs in list must have same n_parallel"
-            assert j.n_parallel == self._queue_elements, (
-                "Mismatch between GPUs Queue Elements and Jobs executed in"
-                "parallel. Fix for optimal resource usage!!"
-            )
+        num_parallel = self._gpu_num_parallel()
 
         with multiprocessing.Pool(processes=num_parallel) as pool:
             # setup gpu resource queue
@@ -525,4 +585,4 @@ class LocalScheduler(AbstractScheduler):
 
 class SlurmScheduler(AbstractScheduler):
     def run(self, overwrite: bool = False):
-        cw_slurm.run_slurm(self.config, len(self.joblist))
+        cw_slurm.run_slurm(self.config, self.joblist)

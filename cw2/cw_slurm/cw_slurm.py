@@ -677,13 +677,387 @@ class SlurmDirectoryManager:
         return "export PYTHONPATH=" + ":".join(new_path) + ":$PYTHONPATH"
 
 
-def run_slurm(conf: cw_config.Config, num_jobs: int) -> None:
+def _job_concurrent_task_capacity(cw_job) -> int:
+    task_count = len(cw_job.tasks)
+    configured_parallelism = cw_job.n_parallel
+    if isinstance(configured_parallelism, str):
+        if configured_parallelism.strip().lower() == "auto":
+            return task_count
+        raise cw_error.ConfigKeyError(
+            "reps_in_parallel must be a positive integer or 'auto'."
+        )
+
+    configured_parallelism = int(configured_parallelism)
+    if configured_parallelism < 1:
+        raise cw_error.ConfigKeyError(
+            "reps_in_parallel must be at least 1."
+        )
+    return min(task_count, configured_parallelism)
+
+
+def _auto_gpu_settings(conf: cw_config.Config):
+    slurm_conf = conf.slurm_config
+    reps_per_gpu = int(slurm_conf.get("reps_per_gpu", 1))
+    if reps_per_gpu < 1:
+        raise cw_error.ConfigKeyError("reps_per_gpu must be at least 1.")
+
+    raw_node_counts = slurm_conf.get("auto_gpu_node_counts", [1, 2, 4])
+    try:
+        node_counts = sorted({int(count) for count in raw_node_counts})
+    except (TypeError, ValueError) as exc:
+        raise cw_error.ConfigKeyError(
+            "auto_gpu_node_counts must be a list of positive integers."
+        ) from exc
+    if not node_counts or node_counts[0] < 1:
+        raise cw_error.ConfigKeyError(
+            "auto_gpu_node_counts must contain positive integers."
+        )
+
+    raw_models = slurm_conf.get("auto_gpu_models", [])
+    if isinstance(raw_models, str):
+        raw_models = [raw_models]
+    if not isinstance(raw_models, list):
+        raise cw_error.ConfigKeyError(
+            "auto_gpu_models must be a list of Slurm node feature names."
+        )
+    gpu_models = [str(model).strip() for model in raw_models]
+    if any(
+        not model
+        or not all(char.isalnum() or char in "_.-" for char in model)
+        for model in gpu_models
+    ):
+        raise cw_error.ConfigKeyError(
+            "auto_gpu_models contains an invalid Slurm node feature."
+        )
+
+    fallback_count = int(slurm_conf.get("auto_gpu_fallback_count", 2))
+    if fallback_count not in node_counts:
+        raise cw_error.ConfigKeyError(
+            "auto_gpu_fallback_count must be present in auto_gpu_node_counts."
+        )
+
+    sbatch_args = slurm_conf.get("sbatch_args", {})
+    if not isinstance(sbatch_args, dict):
+        raise cw_error.ConfigKeyError(
+            "num_gpus=auto requires sbatch_args to be a dictionary."
+        )
+    fixed_gpu_args = {
+        "gres",
+        "gpus",
+        "gpus-per-node",
+        "gpus-per-task",
+    }.intersection(sbatch_args)
+    if fixed_gpu_args:
+        raise cw_error.ConfigKeyError(
+            "num_gpus=auto cannot be combined with fixed GPU sbatch arguments: "
+            "{}.".format(", ".join(sorted(fixed_gpu_args)))
+        )
+
+    return reps_per_gpu, node_counts, gpu_models, fallback_count
+
+
+def _auto_gpu_constraint(gpu_count: int, gpu_models: list) -> str:
+    gpu_feature = "GPUx{}".format(gpu_count)
+    if not gpu_models:
+        return gpu_feature
+    return "{}&({})".format(gpu_feature, "|".join(gpu_models))
+
+
+def query_idle_auto_gpu_nodes(
+    conf: cw_config.Config,
+    node_counts: list,
+    gpu_models: list,
+):
+    partition = conf.slurm_config.get("partition")
+    if not partition:
+        raise cw_error.ConfigKeyError(
+            "num_gpus=auto requires a Slurm partition."
+        )
+    command = [
+        "sinfo",
+        "-h",
+        "-N",
+        "-t",
+        "idle",
+        "-p",
+        partition,
+        "-o",
+        "%f",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        raise cw_error.ConfigKeyError(
+            "num_gpus=auto could not inspect idle Slurm nodes with: {}."
+            .format(" ".join(command))
+        ) from exc
+
+    idle_counts = {count: 0 for count in node_counts}
+    model_features = set(gpu_models)
+    for line in result.stdout.splitlines():
+        features = {
+            feature.strip()
+            for feature in line.split(",")
+            if feature.strip()
+        }
+        if model_features and not features.intersection(model_features):
+            continue
+        for gpu_count in node_counts:
+            if "GPUx{}".format(gpu_count) in features:
+                idle_counts[gpu_count] += 1
+                break
+    return idle_counts
+
+
+def _eligible_auto_gpu_counts(
+    cw_job,
+    reps_per_gpu: int,
+    node_counts: list,
+):
+    concurrent_capacity = _job_concurrent_task_capacity(cw_job)
+    gpu_capacity = concurrent_capacity // reps_per_gpu
+    eligible_counts = [
+        count for count in node_counts if count <= gpu_capacity
+    ]
+    if not eligible_counts:
+        raise cw_error.ConfigKeyError(
+            "No GPU node size can be fully occupied: Slurm array task has "
+            "{} concurrent runs, reps_per_gpu={}, and allowed node sizes are "
+            "{}.".format(concurrent_capacity, reps_per_gpu, node_counts)
+        )
+    return eligible_counts
+
+
+def resolve_auto_gpu_resources(
+    conf: cw_config.Config,
+    jobs: list,
+    idle_node_counts=None,
+):
+    configured_num_gpus = conf.slurm_config.get("num_gpus", 0)
+    if not (
+        isinstance(configured_num_gpus, str)
+        and configured_num_gpus.strip().lower() == "auto"
+    ):
+        return None
+    if not jobs:
+        raise cw_error.ConfigKeyError(
+            "num_gpus=auto requires at least one expanded Slurm job."
+        )
+
+    reps_per_gpu, node_counts, gpu_models, fallback_count = (
+        _auto_gpu_settings(conf)
+    )
+    eligible_by_job = [
+        _eligible_auto_gpu_counts(cw_job, reps_per_gpu, node_counts)
+        for cw_job in jobs
+    ]
+    if idle_node_counts is None:
+        idle_node_counts = query_idle_auto_gpu_nodes(
+            conf,
+            node_counts,
+            gpu_models,
+        )
+    try:
+        available_by_count = {
+            count: max(0, int(idle_node_counts.get(count, 0)))
+            for count in node_counts
+        }
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise cw_error.ConfigKeyError(
+            "idle_node_counts must map GPU node sizes to non-negative counts."
+        ) from exc
+
+    remaining = list(range(len(jobs)))
+    assignment = {count: [] for count in node_counts}
+    for gpu_count in sorted(node_counts, reverse=True):
+        available = available_by_count[gpu_count]
+        if available == 0:
+            continue
+        eligible_jobs = [
+            job_idx
+            for job_idx in remaining
+            if gpu_count in eligible_by_job[job_idx]
+        ]
+        selected_jobs = eligible_jobs[:available]
+        assignment[gpu_count].extend(selected_jobs)
+        selected_set = set(selected_jobs)
+        remaining = [
+            job_idx
+            for job_idx in remaining
+            if job_idx not in selected_set
+        ]
+
+    for job_idx in remaining:
+        eligible_counts = eligible_by_job[job_idx]
+        fallback_candidates = [
+            count
+            for count in eligible_counts
+            if count <= fallback_count
+        ]
+        selected_count = (
+            max(fallback_candidates)
+            if fallback_candidates
+            else min(eligible_counts)
+        )
+        assignment[selected_count].append(job_idx)
+
+    assignment = {
+        count: indices
+        for count, indices in assignment.items()
+        if indices
+    }
+    print(
+        "[slurm] Idle GPU nodes matching configured models: {}."
+        .format(available_by_count)
+    )
+    for gpu_count in sorted(assignment, reverse=True):
+        print(
+            "[slurm] GPUx{}: {} array task(s), global indices {}.".format(
+                gpu_count,
+                len(assignment[gpu_count]),
+                _compress_array_indices(assignment[gpu_count]),
+            )
+        )
+    return assignment
+
+
+def _auto_gpu_base_constraint(conf: cw_config.Config, jobs: list) -> str:
+    reps_per_gpu, node_counts, gpu_models, fallback_count = (
+        _auto_gpu_settings(conf)
+    )
+    common_counts = set(node_counts)
+    for cw_job in jobs:
+        common_counts.intersection_update(
+            _eligible_auto_gpu_counts(cw_job, reps_per_gpu, node_counts)
+        )
+    preferred_counts = [
+        count for count in common_counts if count <= fallback_count
+    ]
+    if not preferred_counts:
+        preferred_counts = sorted(common_counts)
+    if not preferred_counts:
+        raise cw_error.ConfigKeyError(
+            "No common fallback GPU node size can run every Slurm array task."
+        )
+    return _auto_gpu_constraint(max(preferred_counts), gpu_models)
+
+
+def _compress_array_indices(indices: list) -> str:
+    sorted_indices = sorted(indices)
+    ranges = []
+    start = previous = sorted_indices[0]
+    for index in sorted_indices[1:]:
+        if index == previous + 1:
+            previous = index
+            continue
+        ranges.append(
+            str(start) if start == previous else "{}-{}".format(start, previous)
+        )
+        start = previous = index
+    ranges.append(
+        str(start) if start == previous else "{}-{}".format(start, previous)
+    )
+    return ",".join(ranges)
+
+
+def _auto_gpu_group_throttles(assignment: dict, max_parallel: int):
+    group_sizes = {
+        gpu_count: len(indices)
+        for gpu_count, indices in assignment.items()
+    }
+    total_jobs = sum(group_sizes.values())
+    if total_jobs <= max_parallel:
+        return group_sizes
+    if max_parallel < len(group_sizes):
+        raise cw_error.ConfigKeyError(
+            "num_parallel_jobs must be at least the number of auto GPU "
+            "submission groups."
+        )
+
+    throttles = {gpu_count: 1 for gpu_count in group_sizes}
+    remaining_slots = max_parallel - len(group_sizes)
+    while remaining_slots > 0:
+        candidates = [
+            gpu_count
+            for gpu_count, size in group_sizes.items()
+            if throttles[gpu_count] < size
+        ]
+        if not candidates:
+            break
+        selected = max(
+            candidates,
+            key=lambda count: (
+                group_sizes[count] / throttles[count],
+                group_sizes[count],
+                count,
+            ),
+        )
+        throttles[selected] += 1
+        remaining_slots -= 1
+    return throttles
+
+
+def _submit_auto_gpu_arrays(
+    conf: cw_config.Config,
+    assignment: dict,
+    slurm_script: str,
+):
+    raw_models = conf.slurm_config.get("auto_gpu_models", [])
+    gpu_models = [raw_models] if isinstance(raw_models, str) else raw_models
+    max_parallel = int(conf.slurm_config["num_parallel_jobs"])
+    throttles = _auto_gpu_group_throttles(assignment, max_parallel)
+    for gpu_count in sorted(assignment, reverse=True):
+        constraint = _auto_gpu_constraint(gpu_count, gpu_models)
+        array_spec = "{}%{}".format(
+            _compress_array_indices(assignment[gpu_count]),
+            throttles[gpu_count],
+        )
+        command = [
+            "sbatch",
+            "--array={}".format(array_spec),
+            "--constraint={}".format(constraint),
+            "--export=ALL,MPRL_RESUBMIT_CONSTRAINT={}".format(constraint),
+            slurm_script,
+        ]
+        print(" ".join(command))
+        subprocess.check_output(command)
+
+
+def run_slurm(conf: cw_config.Config, jobs) -> None:
     """starts slurm execution
 
     Args:
         conf (cw_config.Config): config object
-        num_jobs (int): total number of jobs
+        jobs: expanded cw2 jobs mapped to Slurm array tasks. An integer job
+            count remains supported for fixed-GPU callers.
     """
+    if isinstance(jobs, int):
+        if (
+            isinstance(conf.slurm_config.get("num_gpus"), str)
+            and conf.slurm_config["num_gpus"].strip().lower() == "auto"
+        ):
+            raise cw_error.ConfigKeyError(
+                "num_gpus=auto requires expanded jobs, not only a job count."
+            )
+        num_jobs = jobs
+    else:
+        num_jobs = len(jobs)
+        auto_gpu_assignment = resolve_auto_gpu_resources(conf, jobs)
+        if auto_gpu_assignment is not None:
+            sbatch_args = conf.slurm_config.setdefault("sbatch_args", {})
+            sbatch_args["constraint"] = _auto_gpu_base_constraint(conf, jobs)
+            sbatch_args.pop("prefer", None)
+
     # Finalize Configs
     sc = SlurmConfig(conf)
     sc.finalize(num_jobs)
@@ -694,9 +1068,12 @@ def run_slurm(conf: cw_config.Config, num_jobs: int) -> None:
 
     # Write and call slurm script
     slurm_script = write_slurm_script(sc, dir_mgr)
-    cmd = "sbatch " + slurm_script
-    print(cmd)
-    subprocess.check_output(cmd, shell=True)
+    if not isinstance(jobs, int) and auto_gpu_assignment is not None:
+        _submit_auto_gpu_arrays(conf, auto_gpu_assignment, slurm_script)
+        return
+    command = ["sbatch", slurm_script]
+    print(" ".join(command))
+    subprocess.check_output(command)
 
 
 def write_slurm_script(slurm_conf: SlurmConfig, dir_mgr: SlurmDirectoryManager) -> str:
