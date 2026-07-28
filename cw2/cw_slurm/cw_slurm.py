@@ -994,6 +994,13 @@ def _auto_cpus_per_task(
     return gpu_count * reps_per_gpu * cpus_per_rep
 
 
+def _persist_runtime_config(conf: cw_config.Config) -> str:
+    config_dir = os.path.dirname(os.path.abspath(conf.config_path))
+    runtime_config_path = conf.to_yaml(config_dir, relpath=True)
+    conf.config_path = runtime_config_path
+    return runtime_config_path
+
+
 def resolve_auto_gpu_resources(
     conf: cw_config.Config,
     jobs: list,
@@ -1305,7 +1312,7 @@ def run_slurm(conf: cw_config.Config, jobs) -> None:
             conf.slurm_config["auto_gpu_job_capacities"] = (
                 auto_job_capacities
             )
-            conf.to_yaml(relpath=True)
+            _persist_runtime_config(conf)
 
     # Finalize Configs
     sc = SlurmConfig(conf)

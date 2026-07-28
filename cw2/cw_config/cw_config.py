@@ -115,7 +115,7 @@ class Config:
 
         return slurm_config, experiment_configs
 
-    def to_yaml(self, dir_path: str = "", relpath: bool = True) -> None:
+    def to_yaml(self, dir_path: str = "", relpath: bool = True) -> str:
         """write config back into a YAML file.
 
         Args:
@@ -159,6 +159,7 @@ class Config:
         # Merge into single list
         data = slurm_config + readable_configs
         conf_io.write_yaml(fpath, data)
+        return fpath
 
     def _readable_exp_configs(self, relpath: bool = True) -> List[dict]:
         """Internal function to get more readable objects when written as yaml

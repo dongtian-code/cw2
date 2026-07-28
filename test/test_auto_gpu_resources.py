@@ -311,6 +311,24 @@ def test_auto_cpu_request_respects_reps_per_gpu():
     ) == 64
 
 
+def test_runtime_config_is_persisted_next_to_current_config(tmp_path):
+    current_path = tmp_path / "relative_config.yaml"
+    written = []
+    conf = SimpleNamespace(
+        config_path=str(current_path),
+        to_yaml=lambda directory, relpath: (
+            written.append((directory, relpath))
+            or str(tmp_path / "relative_updated.yaml")
+        ),
+    )
+
+    runtime_path = cw_slurm._persist_runtime_config(conf)
+
+    assert written == [(str(tmp_path), True)]
+    assert runtime_path == str(tmp_path / "relative_updated.yaml")
+    assert conf.config_path == runtime_path
+
+
 def test_auto_cpu_per_rep_can_be_inferred_from_legacy_config():
     conf = _config()
     del conf.slurm_config["cpus_per_rep"]
