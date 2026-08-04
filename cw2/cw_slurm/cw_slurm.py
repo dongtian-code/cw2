@@ -806,7 +806,7 @@ def query_idle_auto_gpu_nodes(
         "-p",
         partition,
         "-o",
-        delimiter.join(["%N", "%f", "%t"]),
+        delimiter.join(["%N", "%f", "%T"]),
     ]
     try:
         result = subprocess.run(
@@ -838,7 +838,10 @@ def query_idle_auto_gpu_nodes(
         node_name, raw_features, state = (
             field.strip() for field in fields
         )
-        if state.lower() != "idle":
+        # Slurm may append state flags (for example ``idle~`` for a
+        # powered-down idle node). Such nodes still satisfy ``-t idle`` and
+        # are valid candidates for scheduling.
+        if not state.lower().startswith("idle"):
             continue
         features = {
             feature.strip()

@@ -140,6 +140,33 @@ def test_idle_node_query_filters_gpu_models(monkeypatch):
     ) == {1: 1, 2: 2, 4: 1}
 
 
+def test_idle_node_query_accepts_p100_and_idle_state_suffixes(monkeypatch):
+    conf = _config()
+    observed_command = []
+
+    def fake_run(command, **_kwargs):
+        observed_command.extend(command)
+        return SimpleNamespace(
+            stdout="\n".join(
+                [
+                    "node-p100-sleep\tGPU,GPUx1,P100\tidle~",
+                    "node-p100-resume\tGPU,GPUx1,P100\tidle#",
+                    "node-p100-busy\tGPU,GPUx1,P100\tallocated",
+                    "node-v100\tGPU,GPUx1,V100\tidle",
+                ]
+            )
+        )
+
+    monkeypatch.setattr(cw_slurm.subprocess, "run", fake_run)
+
+    assert cw_slurm.query_idle_auto_gpu_nodes(
+        conf,
+        [1, 2, 4],
+        ["P100"],
+    ) == {1: 2, 2: 0, 4: 0}
+    assert "\t".join(["%N", "%f", "%T"]) in observed_command
+
+
 def test_pending_priority_query_expands_arrays_and_filters_jobs(monkeypatch):
     conf = _config()
     observed_command = []
