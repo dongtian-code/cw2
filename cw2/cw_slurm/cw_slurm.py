@@ -806,7 +806,7 @@ def query_idle_auto_gpu_nodes(
         "-p",
         partition,
         "-o",
-        delimiter.join(["%f", "%t"]),
+        delimiter.join(["%N", "%f", "%t"]),
     ]
     try:
         result = subprocess.run(
@@ -828,13 +828,16 @@ def query_idle_auto_gpu_nodes(
 
     idle_counts = {count: 0 for count in node_counts}
     model_features = set(gpu_models)
+    counted_nodes = set()
     for line in result.stdout.splitlines():
-        fields = line.rsplit(delimiter, 1)
-        if len(fields) != 2:
+        fields = line.split(delimiter)
+        if len(fields) != 3:
             raise cw_error.ConfigKeyError(
                 "Could not parse idle Slurm node data: {!r}.".format(line)
             )
-        raw_features, state = (field.strip() for field in fields)
+        node_name, raw_features, state = (
+            field.strip() for field in fields
+        )
         if state.lower() != "idle":
             continue
         features = {
@@ -844,9 +847,12 @@ def query_idle_auto_gpu_nodes(
         }
         if model_features and not features.intersection(model_features):
             continue
+        if node_name in counted_nodes:
+            continue
         for gpu_count in node_counts:
             if "GPUx{}".format(gpu_count) in features:
                 idle_counts[gpu_count] += 1
+                counted_nodes.add(node_name)
                 break
     return idle_counts
 
