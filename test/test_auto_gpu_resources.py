@@ -120,11 +120,13 @@ def test_idle_node_query_filters_gpu_models(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(
             stdout="\n".join(
                 [
-                    "GPUx4,H100",
-                    "GPUx4,MI250",
-                    "GPUx2,A100",
-                    "GPUx1,H100",
-                    "GPUx2,H100",
+                    "GPUx4,H100\tidle",
+                    "GPUx4,H100\tdrain",
+                    "GPUx4,P100\tidle",
+                    "GPUx4,MI250\tidle",
+                    "GPUx2,A100\tidle",
+                    "GPUx1,H100\tidle",
+                    "GPUx2,H100\tidle",
                 ]
             )
         ),
