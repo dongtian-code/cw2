@@ -1,7 +1,11 @@
+import errno
+import fcntl
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import time
 import warnings
 from random import random
 from time import sleep
@@ -79,16 +83,27 @@ class WandBLogger(cw_logging.AbstractLogger):
         )
         self.log_path = ""
         self.run = None
+        self._wandb_resume_lock_fd = None
+        self.wandb_run_id = None
+        self.wandb_resume_identity = None
 
     def initialize(self, config: Dict, rep: int, rep_log_path: str) -> None:
         if "wandb" in config.keys():
             self.init_fields(config, rep, rep_log_path)
-            self.connect_to_wandb()
+            try:
+                self.connect_to_wandb()
+            except Exception:
+                self._release_wandb_resume_lock()
+                raise
 
         else:
             warnings.warn("No 'wandb' field in yaml - Ignoring Weights & Biases Logger")
 
     def init_fields(self, config: Dict, rep: int, rep_log_path: str):
+        self.run = None
+        self._wandb_resume_lock_fd = None
+        self.wandb_run_id = None
+        self.wandb_resume_identity = None
         self.log_path = rep_log_path
         self.rep = rep
         self.config = config["wandb"]
@@ -124,13 +139,58 @@ class WandBLogger(cw_logging.AbstractLogger):
             os.environ["WANDB_CACHE_DIR"] = self.wandb_cache_dir
         # Get the model logging directory
         self.wandb_log_model = self.config.get("log_model", False)
-        self.sync_on_finish = bool(self.config.get("sync_on_finish", False))
+        self.sync_on_finish = self._bool_config_value(
+            self.config.get("sync_on_finish", False)
+        )
         sync_timeout = self.config.get("sync_on_finish_timeout", 600)
         self.sync_on_finish_timeout = (
             None
             if sync_timeout is None or float(sync_timeout) <= 0
             else float(sync_timeout)
         )
+        self.sync_on_finish_max_attempts = max(
+            1,
+            int(self.config.get("sync_on_finish_max_attempts", 3)),
+        )
+        self.sync_on_finish_retry_initial_delay = max(
+            0.0,
+            float(
+                self.config.get(
+                    "sync_on_finish_retry_initial_delay",
+                    5.0,
+                )
+            ),
+        )
+        self.sync_on_finish_retry_max_delay = max(
+            self.sync_on_finish_retry_initial_delay,
+            float(
+                self.config.get(
+                    "sync_on_finish_retry_max_delay",
+                    60.0,
+                )
+            ),
+        )
+        self.resume_same_run = self._bool_config_value(
+            self.config.get("resume_same_run", False)
+        )
+        sync_retry_wait_budget = sum(
+            min(
+                self.sync_on_finish_retry_initial_delay * (2**retry_index),
+                self.sync_on_finish_retry_max_delay,
+            )
+            for retry_index in range(
+                self.sync_on_finish_max_attempts - 1
+            )
+        )
+        sync_attempt_budget = (
+            (self.sync_on_finish_timeout or 600)
+            * self.sync_on_finish_max_attempts
+        )
+        resume_lock_timeout = self.config.get(
+            "resume_lock_timeout",
+            sync_attempt_budget + sync_retry_wait_budget + 60,
+        )
+        self.resume_lock_timeout = max(0.0, float(resume_lock_timeout))
         self.model_artifact_exclude = set(
             self.config.get("model_artifact_exclude", [])
         )
@@ -140,6 +200,12 @@ class WandBLogger(cw_logging.AbstractLogger):
             self.model_name = self.config.get("model_name", "model")
         else:
             self.save_model_dir = None
+
+    @staticmethod
+    def _bool_config_value(value):
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
     @staticmethod
     def _optional_path(path):
@@ -168,10 +234,13 @@ class WandBLogger(cw_logging.AbstractLogger):
             return None
 
     def connect_to_wandb(self):
+        if self.resume_same_run and not self._prepare_persistent_run():
+            return
+
         last_error = None
         for i in range(10):
             try:
-                self.run = wandb.init(
+                init_kwargs = dict(
                     project=self.cw2_config["wandb"]["project"],
                     entity=self.entity,
                     group=self.group,
@@ -188,6 +257,12 @@ class WandBLogger(cw_logging.AbstractLogger):
                     if self.cw2_config["wandb"].get("enabled", True)
                     else "disabled",
                 )
+                if self.wandb_run_id is not None:
+                    init_kwargs.update(
+                        id=self.wandb_run_id,
+                        resume="allow",
+                    )
+                self.run = wandb.init(**init_kwargs)
                 self.write_wandb_metadata()
                 return  # if starting the run is successful, exit the loop (and in this case the function)
             except Exception as e:
@@ -204,6 +279,175 @@ class WandBLogger(cw_logging.AbstractLogger):
                 sleep(waiting_time)
         warnings.warn("wandb init failed several times.")
         raise last_error
+
+    def _prepare_persistent_run(self):
+        resume_model_dir = self._optional_path(
+            self.cw2_config.get("resume_model_dir")
+        )
+        if resume_model_dir is None:
+            warnings.warn(
+                "wandb.resume_same_run is enabled, but resume_model_dir is "
+                "unavailable. Starting a normal W&B run without persistent "
+                "resume identity."
+            )
+            return True
+
+        identity_payload = {
+            "entity": self.entity,
+            "experiment": self.cw2_config.get("_experiment_name"),
+            "group": self.group,
+            "iterations": self.cw2_config.get("iterations"),
+            "params": self.cw2_config.get("params"),
+            "project": self.cw2_config["wandb"]["project"],
+            "resume_scope_name": self.cw2_config.get("resume_scope_name"),
+            "seed": self.cw2_config.get("seed"),
+        }
+        identity_json = json.dumps(
+            identity_payload,
+            default=str,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        identity = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+        identity_dir = os.path.join(
+            os.path.dirname(os.path.dirname(resume_model_dir)),
+            ".wandb_runs",
+        )
+        os.makedirs(identity_dir, exist_ok=True)
+
+        lock_path = os.path.join(identity_dir, f"{identity}.lock")
+        if not self._acquire_wandb_resume_lock(
+            lock_path=lock_path,
+            resume_model_dir=resume_model_dir,
+        ):
+            return False
+
+        record_path = os.path.join(identity_dir, f"{identity}.json")
+        record = self._read_persistent_run_record(record_path, identity)
+        created = record is None
+        if created:
+            record = {
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "entity": self.entity,
+                "group": self.group,
+                "identity": identity,
+                "project": self.cw2_config["wandb"]["project"],
+                "run_id": wandb.util.generate_id(),
+                "run_name": self.runname,
+                "seed": self.cw2_config.get("seed"),
+            }
+            self._write_persistent_run_record(record_path, record)
+
+        self.wandb_run_id = str(record["run_id"])
+        self.wandb_resume_identity = identity
+        self.runname = str(record.get("run_name") or self.runname)
+        self.cw2_config["wandb_run_id"] = self.wandb_run_id
+        action = "Created" if created else "Resuming"
+        print(
+            f"[wandb] {action} persistent run {self.wandb_run_id} "
+            f"using {record_path}",
+            flush=True,
+        )
+        return True
+
+    def _acquire_wandb_resume_lock(self, lock_path, resume_model_dir):
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        deadline = time.monotonic() + self.resume_lock_timeout
+        active_lock_path = os.path.join(
+            os.path.dirname(resume_model_dir),
+            "active.lock",
+        )
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN):
+                    os.close(lock_fd)
+                    raise
+                if self._file_lock_is_held(active_lock_path):
+                    os.close(lock_fd)
+                    print(
+                        "[wandb] Matching experiment is already active; "
+                        "skipping duplicate W&B initialization.",
+                        flush=True,
+                    )
+                    return False
+                if time.monotonic() >= deadline:
+                    os.close(lock_fd)
+                    raise TimeoutError(
+                        "Timed out waiting for the previous process to finish "
+                        f"the persistent W&B run lock: {lock_path}"
+                    )
+                sleep(0.25)
+                continue
+
+            self._wandb_resume_lock_fd = lock_fd
+            return True
+
+    @staticmethod
+    def _file_lock_is_held(lock_path):
+        if not os.path.isfile(lock_path):
+            return False
+        lock_fd = os.open(lock_path, os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in (errno.EACCES, errno.EAGAIN):
+                    return True
+                raise
+            else:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                return False
+        finally:
+            os.close(lock_fd)
+
+    @staticmethod
+    def _read_persistent_run_record(record_path, identity):
+        if not os.path.isfile(record_path):
+            return None
+        try:
+            with open(record_path, "r") as record_file:
+                record = json.load(record_file)
+        except (OSError, json.JSONDecodeError) as error:
+            warnings.warn(
+                f"Ignoring unreadable persistent W&B run record "
+                f"{record_path}: {error}"
+            )
+            return None
+        if (
+            not isinstance(record, dict)
+            or record.get("identity") != identity
+            or not record.get("run_id")
+        ):
+            warnings.warn(
+                f"Ignoring invalid persistent W&B run record: {record_path}"
+            )
+            return None
+        return record
+
+    @staticmethod
+    def _write_persistent_run_record(record_path, record):
+        tmp_path = f"{record_path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp_path, "w") as record_file:
+                json.dump(record, record_file, indent=2, sort_keys=True)
+                record_file.flush()
+                os.fsync(record_file.fileno())
+            os.replace(tmp_path, record_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def _release_wandb_resume_lock(self):
+        lock_fd = self._wandb_resume_lock_fd
+        if lock_fd is None:
+            return
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+            self._wandb_resume_lock_fd = None
 
     def process(self, data: dict) -> None:
         if self.run is not None:
@@ -245,23 +489,27 @@ class WandBLogger(cw_logging.AbstractLogger):
             self.run.log(filtered_data, step=step)
 
     def finalize(self) -> None:
-        if self.run is not None:
-            run_dir = self._local_run_dir()
-            run_id = getattr(self.run, "id", None)
-            for operation_name, operation in (
-                ("metadata update", self.write_wandb_metadata),
-                ("model artifact upload", self.log_model),
-                ("run finish", self.run.finish),
-            ):
-                try:
-                    operation()
-                except Exception as error:
-                    warnings.warn(
-                        f"W&B {operation_name} failed during finalization: {error}"
-                    )
+        try:
+            if self.run is not None:
+                run_dir = self._local_run_dir()
+                run_id = getattr(self.run, "id", None)
+                for operation_name, operation in (
+                    ("metadata update", self.write_wandb_metadata),
+                    ("model artifact upload", self.log_model),
+                    ("run finish", self.run.finish),
+                ):
+                    try:
+                        operation()
+                    except Exception as error:
+                        warnings.warn(
+                            f"W&B {operation_name} failed during finalization: {error}"
+                        )
 
-            if self.sync_on_finish:
-                self._sync_local_run(run_dir=run_dir, run_id=run_id)
+                if self.sync_on_finish:
+                    self._sync_local_run(run_dir=run_dir, run_id=run_id)
+        finally:
+            self.run = None
+            self._release_wandb_resume_lock()
 
     def _local_run_dir(self):
         run_files_dir = getattr(self.run, "dir", None)
@@ -300,27 +548,54 @@ class WandBLogger(cw_logging.AbstractLogger):
             command.extend(["--id", str(run_id)])
         command.append(run_dir)
 
-        try:
-            result = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=self.sync_on_finish_timeout,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            warnings.warn(f"W&B completion sync failed: {error}")
-            return
+        for attempt in range(1, self.sync_on_finish_max_attempts + 1):
+            try:
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.sync_on_finish_timeout,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                details = str(error)
+            else:
+                if result.returncode == 0:
+                    print(
+                        "[wandb] Completion sync succeeded on attempt "
+                        f"{attempt}/{self.sync_on_finish_max_attempts}: "
+                        f"{run_dir}",
+                        flush=True,
+                    )
+                    return True
+                output = (result.stderr or result.stdout or "").strip()
+                details = (
+                    f"exit code {result.returncode}"
+                    + (f": {output}" if output else "")
+                )
 
-        if result.returncode != 0:
-            details = (result.stderr or result.stdout or "").strip()
-            warnings.warn(
-                "W&B completion sync exited with code "
-                f"{result.returncode}: {details}"
-            )
-            return
+            if attempt >= self.sync_on_finish_max_attempts:
+                warnings.warn(
+                    "W&B completion sync failed after "
+                    f"{self.sync_on_finish_max_attempts} attempt(s): "
+                    f"{details}. Local data remains available at {run_dir}"
+                )
+                return False
 
-        print(f"[wandb] Completion sync succeeded: {run_dir}", flush=True)
+            delay = min(
+                self.sync_on_finish_retry_initial_delay
+                * (2 ** (attempt - 1)),
+                self.sync_on_finish_retry_max_delay,
+            )
+            print(
+                f"[wandb] Completion sync attempt {attempt}/"
+                f"{self.sync_on_finish_max_attempts} failed: {details}. "
+                f"Retrying in {delay:g} seconds.",
+                flush=True,
+            )
+            sleep(delay)
+
+        return False
 
     def _git_metadata_payload(self):
         git_repos = self.cw2_config.get("git_repos")
@@ -359,6 +634,9 @@ class WandBLogger(cw_logging.AbstractLogger):
 
     def write_wandb_metadata(self):
         payload = self._git_metadata_payload()
+        if self.wandb_run_id is not None:
+            payload["persistent_wandb_run_id"] = self.wandb_run_id
+            payload["wandb_resume_identity"] = self.wandb_resume_identity
         if not payload:
             return
 
