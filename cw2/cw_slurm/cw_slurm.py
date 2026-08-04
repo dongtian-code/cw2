@@ -67,8 +67,30 @@ class SlurmConfig:
                 sc[SKEYS.TIME] // 60, sc[SKEYS.TIME] % 60
             )
 
-        if SKEYS.CPU_MEM in sc:
-            sc[SKEYS.SBATCH_ARGS][SKEYS.CPU_MEM] = sc.get(SKEYS.CPU_MEM)
+        if SKEYS.MEM in sc and SKEYS.CPU_MEM in sc:
+            raise cw_error.ConfigKeyError(
+                "Slurm memory must be configured with either mem or "
+                "mem-per-cpu, not both."
+            )
+
+        for memory_key in (SKEYS.MEM, SKEYS.CPU_MEM):
+            if memory_key not in sc:
+                continue
+            configured_memory = sc[memory_key]
+            existing_memory = sc[SKEYS.SBATCH_ARGS].get(memory_key)
+            if (
+                existing_memory is not None
+                and existing_memory != configured_memory
+            ):
+                raise cw_error.ConfigKeyError(
+                    "Conflicting Slurm {} values: top-level {!r} and "
+                    "sbatch_args {!r}.".format(
+                        memory_key,
+                        configured_memory,
+                        existing_memory,
+                    )
+                )
+            sc[SKEYS.SBATCH_ARGS][memory_key] = configured_memory
 
         # DEFAULT OR COMPLEX CONVERSION
         if SKEYS.VENV in sc:

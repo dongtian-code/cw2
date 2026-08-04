@@ -4,6 +4,7 @@ ACCOUNT = "account"
 TIME = "time"
 
 CPU_MEM = "mem-per-cpu"
+MEM = "mem"
 VENV = "venv"
 
 SBATCH_ARGS = "sbatch_args"
