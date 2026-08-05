@@ -21,7 +21,7 @@ import pandas as pd
 import wandb
 
 from cw2.cw_data import cw_logging
-from cw2.util import get_file_names_in_directory
+from cw2.util import convert_param_names, get_file_names_in_directory
 
 
 def reset_wandb_env():
@@ -70,6 +70,75 @@ def group_parameters(list_of_strings: List[str]):
                     substring += k + "_" + subgroups + ","
                 num_subgroups += num_subs
     return substring[:-1], len(groups)
+
+
+def build_sweep_group_name(
+    base_group: Optional[str],
+    experiment_name: str,
+    max_parameter_length: int = 96,
+    excluded_parameter_paths: Optional[Iterable[str]] = None,
+    parameters: Optional[Dict] = None,
+) -> Optional[str]:
+    """Build one readable W&B group for each expanded sweep configuration."""
+    experiment_name = str(experiment_name or "")
+    experiment_base, separator, sweep_parameters = experiment_name.partition("__")
+    sweep_parameters = sweep_parameters.strip("_")
+    if not separator:
+        return base_group
+
+    parameters = parameters or {}
+    for parameter_path in excluded_parameter_paths or ():
+        value = _nested_parameter(parameters, parameter_path)
+        if value is _MISSING_PARAMETER:
+            continue
+        abbreviated_parameter = convert_param_names(
+            [str(parameter_path)],
+            [value],
+        )
+        sweep_parameters = (
+            f"_{sweep_parameters}_"
+            .replace(f"_{abbreviated_parameter}_", "_")
+            .strip("_")
+        )
+
+    group_prefix = str(base_group or experiment_base).strip()
+    if not sweep_parameters:
+        return group_prefix or None
+
+    max_parameter_length = int(max_parameter_length)
+    if max_parameter_length < 16:
+        raise ValueError(
+            "wandb.sweep_group_max_parameter_length must be at least 16."
+        )
+
+    parameter_tokens = [
+        token for token in sweep_parameters.split("_") if token
+    ]
+    short_parameters = group_parameters(parameter_tokens)[0]
+    if len(short_parameters) > max_parameter_length:
+        digest = hashlib.sha256(
+            sweep_parameters.encode("utf-8")
+        ).hexdigest()[:10]
+        prefix_length = max_parameter_length - len(digest) - 1
+        short_parameters = (
+            short_parameters[:prefix_length] + "~" + digest
+        )
+
+    if not group_prefix:
+        return short_parameters
+    return f"{group_prefix} | {short_parameters}"
+
+
+_MISSING_PARAMETER = object()
+
+
+def _nested_parameter(parameters: Dict, parameter_path: str):
+    value = parameters
+    for key in str(parameter_path).split("."):
+        if not isinstance(value, dict) or key not in value:
+            return _MISSING_PARAMETER
+        value = value[key]
+    return value
 
 
 class WandBLogger(cw_logging.AbstractLogger):
@@ -121,6 +190,24 @@ class WandBLogger(cw_logging.AbstractLogger):
         # have entity and group config entry optional
         self.entity = self.config.get("entity", None)
         self.group = self.config.get("group", None)
+        self.group_by_sweep = self._bool_config_value(
+            self.config.get("group_by_sweep", False)
+        )
+        if self.group_by_sweep:
+            self.group = build_sweep_group_name(
+                base_group=self.group,
+                experiment_name=config.get("_experiment_name", ""),
+                max_parameter_length=self.config.get(
+                    "sweep_group_max_parameter_length",
+                    96,
+                ),
+                excluded_parameter_paths=self.config.get(
+                    "sweep_group_exclude_parameters",
+                    (),
+                ),
+                parameters=config.get("params", {}),
+            )
+            print(f"[wandb] Sweep group: {self.group}", flush=True)
         self.wandb_local_dir = self._optional_path(
             os.environ.get("MPRL_WANDB_DIR", None)
             or self.config.get("local_dir", None)
