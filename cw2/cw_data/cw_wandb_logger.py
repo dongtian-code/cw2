@@ -193,7 +193,10 @@ class WandBLogger(cw_logging.AbstractLogger):
         self.group_by_sweep = self._bool_config_value(
             self.config.get("group_by_sweep", False)
         )
-        if self.group_by_sweep:
+        self.sweep_group_resolved = self._bool_config_value(
+            self.config.get("sweep_group_resolved", False)
+        )
+        if self.group_by_sweep and not self.sweep_group_resolved:
             self.group = build_sweep_group_name(
                 base_group=self.group,
                 experiment_name=config.get("_experiment_name", ""),
@@ -207,6 +210,7 @@ class WandBLogger(cw_logging.AbstractLogger):
                 ),
                 parameters=config.get("params", {}),
             )
+        if self.group_by_sweep or self.sweep_group_resolved:
             print(f"[wandb] Sweep group: {self.group}", flush=True)
         self.wandb_local_dir = self._optional_path(
             os.environ.get("MPRL_WANDB_DIR", None)

@@ -161,3 +161,23 @@ def test_logger_applies_sweep_group_exclusions(tmp_path):
     logger.init_fields(config, rep=0, rep_log_path=str(tmp_path / "rep_00"))
 
     assert logger.group == "study | pol.arg.tra.nl2"
+
+
+def test_logger_does_not_expand_a_pre_resolved_group_twice(tmp_path):
+    config = {
+        "_experiment_name": "experiment__pol.arg.tra.nl2",
+        "params": {},
+        "wandb": {
+            "enabled": False,
+            "group": "study | pol.arg.tra.nl2",
+            "group_by_sweep": False,
+            "sweep_group_resolved": True,
+            "log_model": False,
+            "project": "project",
+        },
+    }
+
+    logger = WandBLogger()
+    logger.init_fields(config, rep=0, rep_log_path=str(tmp_path / "rep_00"))
+
+    assert logger.group == "study | pol.arg.tra.nl2"
