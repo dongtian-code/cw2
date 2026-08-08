@@ -1041,6 +1041,78 @@ def _persist_runtime_config(conf: cw_config.Config) -> str:
     return runtime_config_path
 
 
+def _balanced_fallback_job_counts(
+    remaining_tasks: int,
+    reps_per_gpu: int,
+    node_counts: list,
+    fallback_count: int,
+    existing_job_counts: dict,
+):
+    eligible_counts = sorted(
+        (count for count in node_counts if count <= fallback_count),
+        reverse=True,
+    )
+    if remaining_tasks == 0:
+        return {count: 0 for count in eligible_counts}
+    if not eligible_counts or remaining_tasks % reps_per_gpu != 0:
+        return None
+
+    remaining_gpu_units = remaining_tasks // reps_per_gpu
+    allocation = {count: 0 for count in eligible_counts}
+    best_score = None
+    best_allocation = None
+
+    # Rotate exact tie-breaking so an otherwise identical solution does not
+    # consistently favor one GPU node size.
+    ascending_counts = sorted(eligible_counts)
+    rotation = sum(existing_job_counts.values()) % len(ascending_counts)
+    tie_order = ascending_counts[rotation:] + ascending_counts[:rotation]
+
+    def consider_candidate():
+        nonlocal best_score, best_allocation
+        final_counts = {
+            count: existing_job_counts.get(count, 0) + allocation[count]
+            for count in eligible_counts
+        }
+        values = list(final_counts.values())
+        spread = max(values) - min(values)
+        pairwise_imbalance = sum(
+            (values[left] - values[right]) ** 2
+            for left in range(len(values))
+            for right in range(left + 1, len(values))
+        )
+        score = (
+            spread,
+            pairwise_imbalance,
+            sum(allocation.values()),
+            tuple(-final_counts[count] for count in tie_order),
+        )
+        if best_score is None or score < best_score:
+            best_score = score
+            best_allocation = dict(allocation)
+
+    def search(position, units_left):
+        gpu_count = eligible_counts[position]
+        if position == len(eligible_counts) - 1:
+            if units_left % gpu_count != 0:
+                return
+            allocation[gpu_count] = units_left // gpu_count
+            consider_candidate()
+            allocation[gpu_count] = 0
+            return
+
+        for number_of_jobs in range(units_left // gpu_count + 1):
+            allocation[gpu_count] = number_of_jobs
+            search(
+                position + 1,
+                units_left - number_of_jobs * gpu_count,
+            )
+        allocation[gpu_count] = 0
+
+    search(0, remaining_gpu_units)
+    return best_allocation
+
+
 def resolve_auto_gpu_resources(
     conf: cw_config.Config,
     jobs: list,
@@ -1146,25 +1218,26 @@ def resolve_auto_gpu_resources(
             remaining_idle_by_count[gpu_count] -= number_of_jobs
             remaining_tasks -= number_of_jobs * capacity
 
-        while remaining_tasks > 0:
-            fallback_candidates = [
-                count
-                for count in node_counts
-                if count <= fallback_count
-                and count * reps_per_gpu <= remaining_tasks
-            ]
-            if not fallback_candidates:
-                raise cw_error.ConfigKeyError(
-                    "Expanded experiment group with {} run(s) cannot fully "
-                    "occupy any configured GPU node with reps_per_gpu={}. "
-                    "Adjust repetitions or reps_per_gpu.".format(
-                        task_count,
-                        reps_per_gpu,
-                    )
+        fallback_jobs = _balanced_fallback_job_counts(
+            remaining_tasks=remaining_tasks,
+            reps_per_gpu=reps_per_gpu,
+            node_counts=node_counts,
+            fallback_count=fallback_count,
+            existing_job_counts={
+                count: len(assignment[count]) for count in node_counts
+            },
+        )
+        if fallback_jobs is None:
+            raise cw_error.ConfigKeyError(
+                "Expanded experiment group with {} run(s) cannot fully "
+                "occupy any configured GPU node with reps_per_gpu={}. "
+                "Adjust repetitions or reps_per_gpu.".format(
+                    task_count,
+                    reps_per_gpu,
                 )
-            selected_count = max(fallback_candidates)
-            add_jobs(selected_count, 1)
-            remaining_tasks -= selected_count * reps_per_gpu
+            )
+        for gpu_count in sorted(fallback_jobs, reverse=True):
+            add_jobs(gpu_count, fallback_jobs[gpu_count])
 
     assignment = {
         count: indices
