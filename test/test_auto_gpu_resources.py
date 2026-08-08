@@ -56,8 +56,8 @@ def test_auto_gpu_assignment_uses_only_current_idle_nodes_then_fallback():
 
     assert assignment == {
         4: [0, 1],
-        2: [2, 3, 4, 6, 7, 8, 9, 10, 11],
-        1: [5, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+        2: [2, 3, 4, 6, 7, 8, 9, 10, 11, 12],
+        1: [5, 13, 14, 15, 16, 17, 18, 19],
     }
 
 
@@ -208,8 +208,8 @@ def test_auto_gpu_assignment_subtracts_pending_priority_demand():
     )
 
     assert assignment == {
-        2: [0, 1, 2, 3, 5, 6, 7, 8],
-        1: [4, 9, 10, 11, 12, 13, 14, 15],
+        2: [0, 1, 2, 3, 5, 6, 7, 8, 9],
+        1: [4, 10, 11, 12, 13, 14],
     }
 
 
@@ -238,8 +238,8 @@ def test_auto_gpu_job_capacities_cover_every_run_exactly():
         return_job_capacities=True,
     )
 
-    assert len(assignment[2]) == 33
-    assert len(assignment[1]) == 34
+    assert len(assignment[2]) == 36
+    assert len(assignment[1]) == 28
     assert 4 not in assignment
     assert sum(capacities) == 100
     assert all(
@@ -267,7 +267,7 @@ def test_auto_gpu_fallback_balances_all_node_sizes_when_exactly_possible():
     assert sum(capacities) == 42
 
 
-def test_auto_gpu_fallback_compensates_for_existing_idle_assignments():
+def test_auto_gpu_fallback_balances_only_tasks_beyond_idle_capacity():
     conf = _config(fallback_count=4)
 
     assignment, capacities = cw_slurm.resolve_auto_gpu_resources(
@@ -278,11 +278,31 @@ def test_auto_gpu_fallback_compensates_for_existing_idle_assignments():
     )
 
     assert {count: len(indices) for count, indices in assignment.items()} == {
-        1: 3,
-        2: 3,
-        4: 3,
+        1: 1,
+        2: 2,
+        4: 4,
     }
     assert sum(capacities) == 21
+
+
+def test_auto_gpu_fallback_does_not_rebalance_available_node_assignments():
+    conf = _config(fallback_count=4)
+
+    assignment, capacities = cw_slurm.resolve_auto_gpu_resources(
+        conf,
+        [_job(200)],
+        idle_node_counts={4: 11, 2: 3, 1: 24},
+        return_job_capacities=True,
+    )
+
+    # The first 11/3/24 jobs consume currently idle nodes. Only the remaining
+    # 126 runs are balanced, adding exactly 18 jobs for each node size.
+    assert {count: len(indices) for count, indices in assignment.items()} == {
+        1: 42,
+        2: 21,
+        4: 29,
+    }
+    assert sum(capacities) == 200
 
 
 def test_job_factory_applies_dynamic_reps_per_job_and_parallelism():

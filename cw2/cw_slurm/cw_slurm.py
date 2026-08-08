@@ -1046,7 +1046,6 @@ def _balanced_fallback_job_counts(
     reps_per_gpu: int,
     node_counts: list,
     fallback_count: int,
-    existing_job_counts: dict,
 ):
     eligible_counts = sorted(
         (count for count in node_counts if count <= fallback_count),
@@ -1062,19 +1061,11 @@ def _balanced_fallback_job_counts(
     best_score = None
     best_allocation = None
 
-    # Rotate exact tie-breaking so an otherwise identical solution does not
-    # consistently favor one GPU node size.
-    ascending_counts = sorted(eligible_counts)
-    rotation = sum(existing_job_counts.values()) % len(ascending_counts)
-    tie_order = ascending_counts[rotation:] + ascending_counts[:rotation]
-
     def consider_candidate():
         nonlocal best_score, best_allocation
-        final_counts = {
-            count: existing_job_counts.get(count, 0) + allocation[count]
-            for count in eligible_counts
-        }
-        values = list(final_counts.values())
+        # Idle-node assignments are already runnable and must not distort the
+        # balancing of jobs that exceed currently available capacity.
+        values = list(allocation.values())
         spread = max(values) - min(values)
         pairwise_imbalance = sum(
             (values[left] - values[right]) ** 2
@@ -1085,7 +1076,7 @@ def _balanced_fallback_job_counts(
             spread,
             pairwise_imbalance,
             sum(allocation.values()),
-            tuple(-final_counts[count] for count in tie_order),
+            tuple(-allocation[count] for count in eligible_counts),
         )
         if best_score is None or score < best_score:
             best_score = score
@@ -1223,9 +1214,6 @@ def resolve_auto_gpu_resources(
             reps_per_gpu=reps_per_gpu,
             node_counts=node_counts,
             fallback_count=fallback_count,
-            existing_job_counts={
-                count: len(assignment[count]) for count in node_counts
-            },
         )
         if fallback_jobs is None:
             raise cw_error.ConfigKeyError(
