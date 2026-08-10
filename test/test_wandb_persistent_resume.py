@@ -47,6 +47,7 @@ def _fake_wandb_init(tmp_path, calls):
             dir=str(files_dir),
             finish=lambda: None,
             id=kwargs.get("id", "new-run"),
+            log=lambda data, step=None: None,
         )
 
     return initialize
@@ -138,6 +139,7 @@ def test_resumable_checkpoint_reuses_persistent_run(tmp_path, monkeypatch):
         monkeypatch,
         config,
     )
+    first_logger.process({"num_iterations": 2900})
     first_logger.finalize()
 
     resumed_config = _config(tmp_path)
@@ -154,6 +156,93 @@ def test_resumable_checkpoint_reuses_persistent_run(tmp_path, monkeypatch):
     assert first_calls[0]["id"] == "stable123"
     assert resumed_calls[0]["id"] == "stable123"
     resumed_logger.finalize()
+
+
+def test_checkpoint_epoch_regression_creates_new_wandb_run(
+        tmp_path, monkeypatch):
+    generated_ids = iter(["epoch-998-run", "epoch-65-run"])
+    calls = []
+    monkeypatch.setattr(
+        "cw2.cw_data.cw_wandb_logger.wandb.init",
+        _fake_wandb_init(tmp_path, calls),
+    )
+    monkeypatch.setattr(
+        "cw2.cw_data.cw_wandb_logger.wandb.util.generate_id",
+        lambda: next(generated_ids),
+    )
+
+    first_config = _config(tmp_path)
+    first_config["_checkpoint_resume_preflight"] = {"status": "fresh"}
+    first_logger = WandBLogger()
+    first_logger.initialize(first_config, 0, str(tmp_path / "log-first"))
+    first_logger.process({"num_iterations": 998})
+    first_logger.finalize()
+
+    resumed_config = _config(tmp_path)
+    resumed_config["_checkpoint_resume_preflight"] = {
+        "status": "resumable",
+        "latest_epoch": 65,
+    }
+    resumed_logger = WandBLogger()
+    resumed_logger.initialize(
+        resumed_config,
+        0,
+        str(tmp_path / "log-second"),
+    )
+
+    assert [call["id"] for call in calls] == [
+        "epoch-998-run",
+        "epoch-65-run",
+    ]
+    record_path = next(
+        (tmp_path / "resume" / "scope" / ".wandb_runs").glob("*.json")
+    )
+    record = json.loads(record_path.read_text())
+    assert record["run_id"] == "epoch-65-run"
+    assert record["replaces_run_id"] == "epoch-998-run"
+    assert record["replacement_reason"] == "checkpoint_epoch_regression"
+    assert record["previous_max_logged_step"] == 998
+    assert record["replacement_checkpoint_epoch"] == 65
+    resumed_logger.finalize()
+
+
+def test_runtime_epoch_regression_restarts_wandb_process(
+        tmp_path, monkeypatch):
+    generated_ids = iter(["original-run", "runtime-fork-run"])
+    calls = []
+    monkeypatch.setattr(
+        "cw2.cw_data.cw_wandb_logger.wandb.init",
+        _fake_wandb_init(tmp_path, calls),
+    )
+    monkeypatch.setattr(
+        "cw2.cw_data.cw_wandb_logger.wandb.util.generate_id",
+        lambda: next(generated_ids),
+    )
+
+    logger = WandBLogger()
+    logger.initialize(_config(tmp_path), 0, str(tmp_path / "log"))
+    record_path = next(
+        (tmp_path / "resume" / "scope" / ".wandb_runs").glob("*.json")
+    )
+    record = json.loads(record_path.read_text())
+    record["max_logged_step"] = 998
+    record_path.write_text(json.dumps(record))
+
+    logger.process({"num_iterations": 65})
+
+    assert [call["id"] for call in calls] == [
+        "original-run",
+        "runtime-fork-run",
+    ]
+    assert logger.wandb_run_id == "runtime-fork-run"
+    replacement_record = json.loads(record_path.read_text())
+    assert replacement_record["replacement_reason"] == (
+        "logged_epoch_regression"
+    )
+    assert replacement_record["replaces_run_id"] == "original-run"
+    assert replacement_record["previous_max_logged_step"] == 998
+    assert replacement_record["restart_step"] == 65
+    logger.finalize()
 
 
 def test_complete_checkpoint_skips_wandb_initialization(tmp_path, monkeypatch):

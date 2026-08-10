@@ -2,6 +2,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -153,8 +154,12 @@ class WandBLogger(cw_logging.AbstractLogger):
         self.log_path = ""
         self.run = None
         self._wandb_resume_lock_fd = None
+        self._wandb_record_path = None
+        self._wandb_record_identity = None
         self.wandb_run_id = None
         self.wandb_resume_identity = None
+        self.wandb_forked_from_run_id = None
+        self.wandb_fork_reason = None
 
     def initialize(self, config: Dict, rep: int, rep_log_path: str) -> None:
         if "wandb" in config.keys():
@@ -171,8 +176,12 @@ class WandBLogger(cw_logging.AbstractLogger):
     def init_fields(self, config: Dict, rep: int, rep_log_path: str):
         self.run = None
         self._wandb_resume_lock_fd = None
+        self._wandb_record_path = None
+        self._wandb_record_identity = None
         self.wandb_run_id = None
         self.wandb_resume_identity = None
+        self.wandb_forked_from_run_id = None
+        self.wandb_fork_reason = None
         self.log_path = rep_log_path
         self.rep_idx = rep
         self.rep = config.get("seed", rep)
@@ -333,6 +342,9 @@ class WandBLogger(cw_logging.AbstractLogger):
         if self.resume_same_run and not self._prepare_persistent_run():
             return
 
+        self._start_wandb_run()
+
+    def _start_wandb_run(self):
         last_error = None
         for i in range(10):
             try:
@@ -419,6 +431,8 @@ class WandBLogger(cw_logging.AbstractLogger):
             return False
 
         record_path = os.path.join(identity_dir, f"{identity}.json")
+        self._wandb_record_path = record_path
+        self._wandb_record_identity = identity
         record = self._read_persistent_run_record(record_path, identity)
         checkpoint_preflight = self.cw2_config.get(
             "_checkpoint_resume_preflight",
@@ -439,9 +453,13 @@ class WandBLogger(cw_logging.AbstractLogger):
             return False
 
         replaced_run_id = None
+        replacement_reason = None
+        previous_max_logged_step = None
+        replacement_checkpoint_epoch = None
         non_resumable_statuses = {"fresh", "disabled", "explicit_load"}
         if record is not None and checkpoint_status in non_resumable_statuses:
             replaced_run_id = str(record["run_id"])
+            replacement_reason = "no_compatible_checkpoint"
             record = None
             print(
                 "[wandb] No compatible resumable checkpoint was selected; "
@@ -449,6 +467,31 @@ class WandBLogger(cw_logging.AbstractLogger):
                 f"resume stale W&B run {replaced_run_id}.",
                 flush=True,
             )
+        elif record is not None and checkpoint_status == "resumable":
+            previous_max_logged_step = self._normalize_step(
+                record.get("max_logged_step")
+            )
+            replacement_checkpoint_epoch = self._normalize_step(
+                checkpoint_preflight.get("latest_epoch")
+            )
+            if (
+                previous_max_logged_step is not None
+                and replacement_checkpoint_epoch is not None
+                and replacement_checkpoint_epoch < previous_max_logged_step
+            ):
+                replaced_run_id = str(record["run_id"])
+                replacement_reason = "checkpoint_epoch_regression"
+                record = None
+                self.runname = self._forked_run_name(
+                    replacement_checkpoint_epoch
+                )
+                print(
+                    "[wandb] Selected checkpoint epoch "
+                    f"{replacement_checkpoint_epoch} is behind W&B epoch "
+                    f"{previous_max_logged_step}; creating a new W&B run "
+                    f"instead of resuming {replaced_run_id}.",
+                    flush=True,
+                )
         created = record is None
         if created:
             record = {
@@ -463,14 +506,27 @@ class WandBLogger(cw_logging.AbstractLogger):
             }
             if replaced_run_id is not None:
                 record["replaces_run_id"] = replaced_run_id
-                record["replacement_reason"] = "no_compatible_checkpoint"
+                record["replacement_reason"] = replacement_reason
+            if previous_max_logged_step is not None:
+                record["previous_max_logged_step"] = previous_max_logged_step
+            if replacement_checkpoint_epoch is not None:
+                record["replacement_checkpoint_epoch"] = (
+                    replacement_checkpoint_epoch
+                )
             self._write_persistent_run_record(record_path, record)
 
         self.wandb_run_id = str(record["run_id"])
         self.wandb_resume_identity = identity
         self.runname = str(record.get("run_name") or self.runname)
+        self.wandb_forked_from_run_id = record.get("replaces_run_id")
+        self.wandb_fork_reason = record.get("replacement_reason")
         self.cw2_config["wandb_run_id"] = self.wandb_run_id
         self.cw2_config["wandb_resume_identity"] = self.wandb_resume_identity
+        if self.wandb_forked_from_run_id is not None:
+            self.cw2_config["wandb_forked_from_run_id"] = (
+                self.wandb_forked_from_run_id
+            )
+            self.cw2_config["wandb_fork_reason"] = self.wandb_fork_reason
         if replaced_run_id is not None:
             action = "Created replacement"
         else:
@@ -481,6 +537,119 @@ class WandBLogger(cw_logging.AbstractLogger):
             flush=True,
         )
         return True
+
+    @staticmethod
+    def _normalize_step(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(numeric_value) or numeric_value < 0:
+            return None
+        return int(numeric_value)
+
+    def _forked_run_name(self, step):
+        suffix = f"_restart_e{step}"
+        return f"{self.runname[:max(1, 63 - len(suffix))]}{suffix}"
+
+    def _persistent_record(self):
+        if (
+            self._wandb_record_path is None
+            or self._wandb_record_identity is None
+        ):
+            return None
+        return self._read_persistent_run_record(
+            self._wandb_record_path,
+            self._wandb_record_identity,
+        )
+
+    def _persist_logged_step(self, step):
+        step = self._normalize_step(step)
+        if step is None or self.wandb_run_id is None:
+            return
+        record = self._persistent_record()
+        if (
+            record is None
+            or str(record.get("run_id")) != str(self.wandb_run_id)
+        ):
+            return
+        previous_step = self._normalize_step(record.get("max_logged_step"))
+        if previous_step is not None and step <= previous_step:
+            return
+        record["max_logged_step"] = step
+        record["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._write_persistent_run_record(self._wandb_record_path, record)
+
+    def _maybe_fork_regressed_wandb_run(self, step):
+        step = self._normalize_step(step)
+        if (
+            step is None
+            or not self.resume_same_run
+            or self.wandb_run_id is None
+        ):
+            return
+        record = self._persistent_record()
+        if (
+            record is None
+            or str(record.get("run_id")) != str(self.wandb_run_id)
+        ):
+            return
+        max_logged_step = self._normalize_step(record.get("max_logged_step"))
+        if max_logged_step is None or step >= max_logged_step:
+            return
+        self._fork_wandb_run(
+            current_step=step,
+            previous_max_logged_step=max_logged_step,
+        )
+
+    def _fork_wandb_run(self, current_step, previous_max_logged_step):
+        previous_run_id = self.wandb_run_id
+        previous_run = self.run
+        if previous_run is not None:
+            try:
+                previous_run.finish()
+            except Exception as error:
+                warnings.warn(
+                    "W&B run finish failed while forking a regressed run: "
+                    f"{error}"
+                )
+
+        self.run = None
+        self.wandb_run_id = wandb.util.generate_id()
+        self.runname = self._forked_run_name(current_step)
+        self.wandb_forked_from_run_id = previous_run_id
+        self.wandb_fork_reason = "logged_epoch_regression"
+        replacement_record = {
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "entity": self.entity,
+            "group": self.group,
+            "identity": self._wandb_record_identity,
+            "max_logged_step": current_step,
+            "previous_max_logged_step": previous_max_logged_step,
+            "project": self.cw2_config["wandb"]["project"],
+            "replacement_reason": self.wandb_fork_reason,
+            "replaces_run_id": previous_run_id,
+            "restart_step": current_step,
+            "run_id": self.wandb_run_id,
+            "run_name": self.runname,
+            "seed": self.cw2_config.get("seed"),
+        }
+        self._write_persistent_run_record(
+            self._wandb_record_path,
+            replacement_record,
+        )
+        self.cw2_config["wandb_run_id"] = self.wandb_run_id
+        self.cw2_config["wandb_forked_from_run_id"] = previous_run_id
+        self.cw2_config["wandb_fork_reason"] = self.wandb_fork_reason
+        print(
+            f"[wandb] Epoch regressed from {previous_max_logged_step} to "
+            f"{current_step}; finished run {previous_run_id} and created "
+            f"new run {self.wandb_run_id}.",
+            flush=True,
+        )
+        self._start_wandb_run()
 
     def _acquire_wandb_resume_lock(self, lock_path, resume_model_dir):
         lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
@@ -609,6 +778,7 @@ class WandBLogger(cw_logging.AbstractLogger):
                 if final_iteration
                 else log_step
             )
+            self._maybe_fork_regressed_wandb_run(step)
 
             if "histogram" in self.config:
                 for el in self.config["histogram"]:
@@ -619,6 +789,7 @@ class WandBLogger(cw_logging.AbstractLogger):
                         )
             filtered_data = self.filter(data)
             self.run.log(filtered_data, step=step)
+            self._persist_logged_step(step)
 
     def finalize(self) -> None:
         try:
@@ -769,6 +940,11 @@ class WandBLogger(cw_logging.AbstractLogger):
         if self.wandb_run_id is not None:
             payload["persistent_wandb_run_id"] = self.wandb_run_id
             payload["wandb_resume_identity"] = self.wandb_resume_identity
+        if self.wandb_forked_from_run_id is not None:
+            payload["wandb_forked_from_run_id"] = (
+                self.wandb_forked_from_run_id
+            )
+            payload["wandb_fork_reason"] = self.wandb_fork_reason
         if not payload:
             return
 

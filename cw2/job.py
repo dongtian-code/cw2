@@ -22,6 +22,16 @@ class Job:
         read_only: bool = False,
     ):
         self.tasks = tasks
+        task_rep_ids = [
+            task.get(KEYS.i_REP_IDX, task_index)
+            for task_index, task in enumerate(tasks)
+        ]
+        for task in tasks:
+            # The worker processes use this exact job membership for the
+            # preemption checkpoint barrier. It must reflect dynamic auto-GPU
+            # grouping, not the static YAML reps_per_job value.
+            task["_cw2_job_rep_ids"] = list(task_rep_ids)
+            task["_cw2_job_rep_count"] = len(task_rep_ids)
 
         if exp_cls is not None:
             self.exp = exp_cls()
