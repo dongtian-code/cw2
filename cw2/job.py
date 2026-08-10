@@ -22,14 +22,21 @@ class Job:
         read_only: bool = False,
     ):
         self.tasks = tasks
+        task_ids = list(range(len(tasks)))
         task_rep_ids = [
             task.get(KEYS.i_REP_IDX, task_index)
             for task_index, task in enumerate(tasks)
         ]
-        for task in tasks:
+        for task_index, task in enumerate(tasks):
             # The worker processes use this exact job membership for the
-            # preemption checkpoint barrier. It must reflect dynamic auto-GPU
-            # grouping, not the static YAML reps_per_job value.
+            # preemption checkpoint barrier. Repetition ids are not unique
+            # when one Slurm task packs multiple sweep configurations, so the
+            # barrier must use the job-local task ids instead.
+            task["_cw2_job_task_id"] = task_ids[task_index]
+            task["_cw2_job_task_ids"] = list(task_ids)
+            task["_cw2_job_task_count"] = len(task_ids)
+
+            # Keep the repetition metadata for compatibility and diagnostics.
             task["_cw2_job_rep_ids"] = list(task_rep_ids)
             task["_cw2_job_rep_count"] = len(task_rep_ids)
 

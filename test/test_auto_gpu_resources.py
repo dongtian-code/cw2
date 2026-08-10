@@ -410,7 +410,7 @@ def test_runtime_config_is_persisted_next_to_current_config(tmp_path):
 
     runtime_path = cw_slurm._persist_runtime_config(conf)
 
-    assert written == [(str(tmp_path), True)]
+    assert written == [(str(tmp_path), False)]
     assert runtime_path == str(tmp_path / "relative_updated.yaml")
     assert conf.config_path == runtime_path
 

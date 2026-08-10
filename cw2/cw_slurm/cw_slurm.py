@@ -261,7 +261,7 @@ class SlurmDirectoryManager:
         if SKEYS.EXP_CP_AUTO in sc and SKEYS.EXP_CP_DST not in sc:
             sc[SKEYS.EXP_CP_DST] = os.path.join(
                 sc.get(SKEYS.EXP_CP_AUTO),
-                datetime.datetime.now().strftime("%Y%m%d%G%M%S"),
+                datetime.datetime.now().strftime("%Y%m%d%H%M%S%f"),
             )
         if SKEYS.EXP_CP_DST in sc:
             return sc[SKEYS.EXP_CP_DST]
@@ -1036,7 +1036,10 @@ def _auto_cpus_per_task(
 
 def _persist_runtime_config(conf: cw_config.Config) -> str:
     config_dir = os.path.dirname(os.path.abspath(conf.config_path))
-    runtime_config_path = conf.to_yaml(config_dir, relpath=True)
+    # The runtime config is executed from the code-copy directory. Keeping
+    # result paths relative here would redirect logs and checkpoints into the
+    # code copy instead of the experiment's configured output root.
+    runtime_config_path = conf.to_yaml(config_dir, relpath=False)
     conf.config_path = runtime_config_path
     return runtime_config_path
 
