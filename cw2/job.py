@@ -84,6 +84,7 @@ class Job:
         surrender = None
         crash = False
 
+        self.exp.prepare_logger(c, r)
         self.logger.initialize(c, r, rep_path)
         try:
             self.exp.initialize(c, r, self.logger)

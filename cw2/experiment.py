@@ -6,6 +6,10 @@ from cw2.cw_error import ExperimentSurrender
 
 
 class AbstractExperiment(abc.ABC):
+    def prepare_logger(self, cw_config: dict, rep: int) -> None:
+        """Optionally resolve experiment state needed before logger initialization."""
+        pass
+
     @abc.abstractmethod
     def initialize(
         self, cw_config: dict, rep: int, logger: cw_logging.LoggerArray

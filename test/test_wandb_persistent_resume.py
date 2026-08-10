@@ -3,6 +3,8 @@ import json
 import os
 from types import SimpleNamespace
 
+import pytest
+
 from cw2.cw_data.cw_wandb_logger import WandBLogger
 
 
@@ -88,6 +90,83 @@ def test_resume_same_run_reuses_persisted_id(tmp_path, monkeypatch):
     assert second_calls[0]["resume"] == "allow"
     assert second_calls[0]["name"] == first_name
     second_logger.finalize()
+
+
+@pytest.mark.parametrize("checkpoint_status", ["fresh", "disabled", "explicit_load"])
+def test_non_resumable_restart_replaces_stale_persistent_run(
+        tmp_path, monkeypatch, checkpoint_status):
+    generated_ids = iter(["old-run", "replacement-run"])
+    calls = []
+    monkeypatch.setattr(
+        "cw2.cw_data.cw_wandb_logger.wandb.init",
+        _fake_wandb_init(tmp_path, calls),
+    )
+    monkeypatch.setattr(
+        "cw2.cw_data.cw_wandb_logger.wandb.util.generate_id",
+        lambda: next(generated_ids),
+    )
+
+    first_config = _config(tmp_path)
+    first_config["_checkpoint_resume_preflight"] = {"status": "fresh"}
+    first_logger = WandBLogger()
+    first_logger.initialize(first_config, 0, str(tmp_path / "log-first"))
+    first_logger.finalize()
+
+    second_config = _config(tmp_path)
+    second_config["_checkpoint_resume_preflight"] = {
+        "status": checkpoint_status,
+    }
+    second_logger = WandBLogger()
+    second_logger.initialize(second_config, 0, str(tmp_path / "log-second"))
+    second_logger.finalize()
+
+    assert [call["id"] for call in calls] == ["old-run", "replacement-run"]
+    record_path = next(
+        (tmp_path / "resume" / "scope" / ".wandb_runs").glob("*.json")
+    )
+    record = json.loads(record_path.read_text())
+    assert record["run_id"] == "replacement-run"
+    assert record["replaces_run_id"] == "old-run"
+    assert record["replacement_reason"] == "no_compatible_checkpoint"
+
+
+def test_resumable_checkpoint_reuses_persistent_run(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config["_checkpoint_resume_preflight"] = {"status": "fresh"}
+    first_logger, first_calls = _initialize_logger(
+        tmp_path,
+        monkeypatch,
+        config,
+    )
+    first_logger.finalize()
+
+    resumed_config = _config(tmp_path)
+    resumed_config["_checkpoint_resume_preflight"] = {
+        "status": "resumable",
+        "latest_epoch": 2901,
+    }
+    resumed_logger, resumed_calls = _initialize_logger(
+        tmp_path,
+        monkeypatch,
+        resumed_config,
+    )
+
+    assert first_calls[0]["id"] == "stable123"
+    assert resumed_calls[0]["id"] == "stable123"
+    resumed_logger.finalize()
+
+
+def test_complete_checkpoint_skips_wandb_initialization(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config["_checkpoint_resume_preflight"] = {
+        "status": "complete",
+        "completed_epoch": 5000,
+    }
+    logger, calls = _initialize_logger(tmp_path, monkeypatch, config)
+
+    assert calls == []
+    assert logger.run is None
+    logger.finalize()
 
 
 def test_different_seed_uses_different_persistent_record(tmp_path, monkeypatch):

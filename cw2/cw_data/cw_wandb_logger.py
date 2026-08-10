@@ -174,7 +174,8 @@ class WandBLogger(cw_logging.AbstractLogger):
         self.wandb_run_id = None
         self.wandb_resume_identity = None
         self.log_path = rep_log_path
-        self.rep = rep
+        self.rep_idx = rep
+        self.rep = config.get("seed", rep)
         self.config = config["wandb"]
         self.cw2_config = config
         reset_wandb_env()
@@ -182,7 +183,11 @@ class WandBLogger(cw_logging.AbstractLogger):
         self.use_group_parameters = self.config.get("use_group_parameters", False)
         if self.use_group_parameters:
             self.job_name = group_parameters(self.job_name.split("_"))[0]
-        self.runname = self.job_name + "_rep_{:02d}".format(rep)
+        try:
+            rep_label = f"{int(self.rep):02d}"
+        except (TypeError, ValueError):
+            rep_label = str(self.rep)
+        self.runname = f"{self.job_name}_rep_{rep_label}"
 
         # optional: change the job_type to a fixed alias if the option is present
         if "job_type" in self.config:
@@ -415,6 +420,35 @@ class WandBLogger(cw_logging.AbstractLogger):
 
         record_path = os.path.join(identity_dir, f"{identity}.json")
         record = self._read_persistent_run_record(record_path, identity)
+        checkpoint_preflight = self.cw2_config.get(
+            "_checkpoint_resume_preflight",
+            {},
+        )
+        checkpoint_status = (
+            checkpoint_preflight.get("status")
+            if isinstance(checkpoint_preflight, dict)
+            else None
+        )
+        if checkpoint_status == "complete":
+            print(
+                "[wandb] Matching checkpoint is already complete; skipping W&B "
+                "initialization for this duplicate task.",
+                flush=True,
+            )
+            self._release_wandb_resume_lock()
+            return False
+
+        replaced_run_id = None
+        non_resumable_statuses = {"fresh", "disabled", "explicit_load"}
+        if record is not None and checkpoint_status in non_resumable_statuses:
+            replaced_run_id = str(record["run_id"])
+            record = None
+            print(
+                "[wandb] No compatible resumable checkpoint was selected; "
+                "refusing to "
+                f"resume stale W&B run {replaced_run_id}.",
+                flush=True,
+            )
         created = record is None
         if created:
             record = {
@@ -427,13 +461,20 @@ class WandBLogger(cw_logging.AbstractLogger):
                 "run_name": self.runname,
                 "seed": self.cw2_config.get("seed"),
             }
+            if replaced_run_id is not None:
+                record["replaces_run_id"] = replaced_run_id
+                record["replacement_reason"] = "no_compatible_checkpoint"
             self._write_persistent_run_record(record_path, record)
 
         self.wandb_run_id = str(record["run_id"])
         self.wandb_resume_identity = identity
         self.runname = str(record.get("run_name") or self.runname)
         self.cw2_config["wandb_run_id"] = self.wandb_run_id
-        action = "Created" if created else "Resuming"
+        self.cw2_config["wandb_resume_identity"] = self.wandb_resume_identity
+        if replaced_run_id is not None:
+            action = "Created replacement"
+        else:
+            action = "Created" if created else "Resuming"
         print(
             f"[wandb] {action} persistent run {self.wandb_run_id} "
             f"using {record_path}",

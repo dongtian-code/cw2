@@ -46,6 +46,26 @@ def test_repetitions_of_the_same_sweep_share_the_group(tmp_path):
     assert first.runname != second.runname
 
 
+def test_run_name_uses_concrete_seed_instead_of_repetition_index(tmp_path):
+    config = {
+        "_experiment_name": "experiment",
+        "params": {},
+        "seed": 4,
+        "wandb": {
+            "enabled": False,
+            "log_model": False,
+            "project": "project",
+        },
+    }
+
+    logger = WandBLogger()
+    logger.init_fields(config, rep=0, rep_log_path=str(tmp_path / "rep_04"))
+
+    assert logger.rep_idx == 0
+    assert logger.rep == 4
+    assert logger.runname == "experiment_rep_04"
+
+
 def test_excluded_environment_does_not_create_a_distinct_group():
     parameters = {
         "sampler": {
