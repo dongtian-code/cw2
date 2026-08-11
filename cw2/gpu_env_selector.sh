@@ -124,15 +124,69 @@ print("compatible architectures=" + " ".join(sorted(supported)))
     return 1
 }
 
+_mprl_name_contains_p100() {
+    local value
+    value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    [[ "$value" == *p100* ]]
+}
+
+_mprl_configured_gpu_envs() {
+    local candidate_spec="${MPRL_GPU_ENV_CANDIDATES:-}"
+    local -a candidate_envs
+
+    if [ -n "$candidate_spec" ]; then
+        # Conda environment names cannot contain commas. Accept whitespace too
+        # so the same variable remains convenient in shell and YAML configs.
+        candidate_spec="${candidate_spec//,/ }"
+        read -r -a candidate_envs <<< "$candidate_spec"
+        printf '%s\n' "${candidate_envs[@]}"
+        return
+    fi
+
+    # Backward compatibility for existing Maxwell configurations.
+    printf '%s\n' \
+        "${MPRL_GPU_ENV_DEFAULT:-policy_chunking_transformer_official}" \
+        "${MPRL_GPU_ENV_P100:-policy_chunking_transformer_p100}"
+}
+
+_mprl_order_gpu_env_candidates() {
+    local gpu_names="$1"
+    shift
+    local target_uses_p100=0
+    local candidate_env
+    local -a matching_envs
+    local -a fallback_envs
+
+    if _mprl_name_contains_p100 "$gpu_names"; then
+        target_uses_p100=1
+    fi
+
+    for candidate_env in "$@"; do
+        [ -n "$candidate_env" ] || continue
+        if _mprl_name_contains_p100 "$candidate_env"; then
+            if [ "$target_uses_p100" -eq 1 ]; then
+                matching_envs+=("$candidate_env")
+            else
+                fallback_envs+=("$candidate_env")
+            fi
+        elif [ "$target_uses_p100" -eq 0 ]; then
+            matching_envs+=("$candidate_env")
+        else
+            fallback_envs+=("$candidate_env")
+        fi
+    done
+
+    printf '%s\n' "${matching_envs[@]}" "${fallback_envs[@]}"
+}
+
 _mprl_select_gpu_conda_env() {
     local gpu_names
-    local p100_env
-    local default_env
     local selected_env=""
     local selected_prefix=""
     local tested_envs=""
     local candidate_env
     local selected_ld_library_path
+    local -a configured_envs
     local -a candidate_envs
 
     MPRL_CONDA_BASE="$(_mprl_conda_base)"
@@ -148,12 +202,22 @@ _mprl_select_gpu_conda_env() {
         return 1
     fi
 
-    p100_env="${MPRL_GPU_ENV_P100:-policy_chunking_transformer_p100}"
-    default_env="${MPRL_GPU_ENV_DEFAULT:-policy_chunking_transformer_official}"
-    case "$gpu_names" in
-        *P100*) candidate_envs=("$p100_env" "$default_env") ;;
-        *) candidate_envs=("$default_env" "$p100_env") ;;
-    esac
+    while IFS= read -r candidate_env; do
+        [ -n "$candidate_env" ] && configured_envs+=("$candidate_env")
+    done < <(_mprl_configured_gpu_envs)
+    if [ "${#configured_envs[@]}" -eq 0 ]; then
+        echo "[slurm] MPRL_GPU_ENV_CANDIDATES does not contain any environments." >&2
+        return 1
+    fi
+
+    # Environment roles are inferred from their names. This keeps the
+    # selector project-independent: each project only supplies its candidate
+    # list, and an environment containing "p100" is preferred exactly for a
+    # P100 worker. Keep the other class as a compatibility fallback; every
+    # candidate is still validated against the visible GPU before use.
+    while IFS= read -r candidate_env; do
+        [ -n "$candidate_env" ] && candidate_envs+=("$candidate_env")
+    done < <(_mprl_order_gpu_env_candidates "$gpu_names" "${configured_envs[@]}")
 
     for candidate_env in "${candidate_envs[@]}"; do
         case " $tested_envs " in
