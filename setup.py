@@ -48,6 +48,6 @@ setup(
     # What does your project relate to?
     keywords=["scientific", "experiments", "distributed computing", "mpi", "research"],
     packages=find_packages(),
-    package_data={"cw2": ["default_sbatch.sh"]},
+    package_data={"cw2": ["default_sbatch.sh", "gpu_env_selector.sh"]},
     install_requires=["PyYAML", "numpy", "pandas", "joblib"],
 )

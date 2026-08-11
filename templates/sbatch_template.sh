@@ -21,22 +21,14 @@
 # Activate the virtualenv / conda environment
 %%venv%%
 
-# Make PyTorch and pip-installed CUDA split libraries visible in batch jobs.
-if [ -n "$CONDA_PREFIX" ]; then
-    PY_SITE_PACKAGES="$CONDA_PREFIX/lib/python3.11/site-packages"
-    for lib_dir in "$PY_SITE_PACKAGES/torch/lib" "$PY_SITE_PACKAGES"/nvidia/*/lib; do
-        if [ -d "$lib_dir" ]; then
-            export LD_LIBRARY_PATH="$lib_dir:$LD_LIBRARY_PATH"
-        fi
-    done
-fi
-
 # Export Pythonpath
 %%pythonpath%%
 
 # Additional Instructions from CONFIG.yml
 %%sh_lines%%
 
-python3 %%python_script%% %%path_to_yaml_config%% -j $SLURM_ARRAY_TASK_ID %%cw_args%%
+%%gpu_env_selector%%
+
+"$MPRL_PYTHON_BIN" %%python_script%% %%path_to_yaml_config%% -j $SLURM_ARRAY_TASK_ID %%cw_args%%
 
 # THIS WAS BUILT FROM THE DEFAULLT SBATCH TEMPLATE

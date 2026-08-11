@@ -1460,6 +1460,11 @@ def write_slurm_script(slurm_conf: SlurmConfig, dir_mgr: SlurmDirectoryManager) 
 
     exp_main_file = os.path.relpath(__main__.__file__, os.getcwd())
     config_exec_path = dir_mgr.get_config_exec_path(conf.config_path)
+    gpu_env_selector_path = os.path.join(
+        os.path.dirname(__file__), "../gpu_env_selector.sh"
+    )
+    with open(gpu_env_selector_path, "r") as selector_file:
+        gpu_env_selector = selector_file.read().rstrip()
 
     fid_in = open(template_path, "r")
     fid_out = open(output_path, "w")
@@ -1487,6 +1492,7 @@ def write_slurm_script(slurm_conf: SlurmConfig, dir_mgr: SlurmDirectoryManager) 
         tline = tline.replace("%%time%%", sc[SKEYS.TIME])
 
         tline = tline.replace("%%sh_lines%%", sc[SKEYS.SH_LINES])
+        tline = tline.replace("%%gpu_env_selector%%", gpu_env_selector)
 
         tline = tline.replace("%%venv%%", sc[SKEYS.VENV])
         tline = tline.replace("%%pythonpath%%", dir_mgr.get_py_path())
