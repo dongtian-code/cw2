@@ -92,6 +92,29 @@ def test_excluded_environment_does_not_create_a_distinct_group():
     assert second == first
 
 
+def test_excluded_seed_does_not_create_a_distinct_group():
+    parameters = {
+        "seed": 5,
+        "policy": {"args": {"learning_rate": 0.001}},
+    }
+    first = build_sweep_group_name(
+        "study",
+        "experiment__s5_pol.arg.lr0.001",
+        excluded_parameter_paths=["seed"],
+        parameters=parameters,
+    )
+    parameters["seed"] = 6
+    second = build_sweep_group_name(
+        "study",
+        "experiment__s6_pol.arg.lr0.001",
+        excluded_parameter_paths=["seed"],
+        parameters=parameters,
+    )
+
+    assert first == "study | pol.arg.lr0.001"
+    assert second == first
+
+
 def test_non_excluded_sweep_parameters_still_create_distinct_groups():
     parameters = {
         "sampler": {

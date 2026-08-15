@@ -10,6 +10,37 @@ from cw2.cw_config import cw_conf_keys as KEY
 from cw2.cw_data import cw_logging
 
 
+_EXPLICIT_SEED_PATHS = {
+    ("seed",),
+    ("sampler", "args", "seed"),
+}
+
+
+def _is_explicit_seed_path(parameter_path: tuple) -> bool:
+    return tuple(parameter_path) in _EXPLICIT_SEED_PATHS
+
+
+def _normalize_explicit_seed(value, parameter_path: tuple) -> int:
+    if isinstance(value, bool):
+        raise ValueError(
+            f"Explicit seed sweep value at {'.'.join(parameter_path)} must "
+            f"be an integer, got {value!r}."
+        )
+    try:
+        seed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Explicit seed sweep value at {'.'.join(parameter_path)} must "
+            f"be an integer, got {value!r}."
+        ) from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(
+            f"Explicit seed sweep value at {'.'.join(parameter_path)} must "
+            f"be an integer, got {value!r}."
+        )
+    return seed
+
+
 def unfold_exps(exp_configs: List[dict], debug: bool, debug_all: bool) -> List[dict]:
     """unfolds a list of experiment configurations into the different
     hyperparameter runs and repetitions
@@ -104,6 +135,21 @@ def params_combine(config: dict, key: str, iter_func) -> List[dict]:
     # value is the list of values
     tuple_dict = util.flatten_dict_to_tuple_keys(config[key])
     _param_names = [".".join(t) for t in tuple_dict]
+    name_parameter_indices = [
+        index
+        for index, path in enumerate(tuple_dict)
+        if not _is_explicit_seed_path(path)
+    ]
+
+    explicit_seed_paths = [
+        path for path in tuple_dict if _is_explicit_seed_path(path)
+    ]
+    if len(explicit_seed_paths) > 1:
+        formatted_paths = ", ".join(".".join(path) for path in explicit_seed_paths)
+        raise ValueError(
+            f"Sweep {key!r} defines seed more than once ({formatted_paths}). "
+            "Use either seed or sampler.args.seed."
+        )
 
     param_lengths = map(len, tuple_dict.values())
     if key.startswith(KEY.LIST) and len(set(param_lengths)) != 1:
@@ -122,10 +168,28 @@ def params_combine(config: dict, key: str, iter_func) -> List[dict]:
             _config[KEY.PARAMS] = {}
 
         # Expand Grid/List Parameters
+        explicit_seed = None
         for i, t in enumerate(tuple_dict.keys()):
-            util.insert_deep_dictionary(d=_config.get(KEY.PARAMS), t=t, value=values[i])
+            value = values[i]
+            if _is_explicit_seed_path(t):
+                value = _normalize_explicit_seed(value, t)
+                explicit_seed = value
+            util.insert_deep_dictionary(
+                d=_config.get(KEY.PARAMS), t=t, value=value
+            )
 
-        _config = extend_config_name(_config, _param_names, values)
+        if explicit_seed is not None:
+            # A seed sweep enumerates concrete runs. Do not multiply every
+            # explicit seed by the experiment's repetition count.
+            _config["seed"] = explicit_seed
+            _config[KEY.REPS] = 1
+
+        if name_parameter_indices:
+            _config = extend_config_name(
+                _config,
+                [_param_names[index] for index in name_parameter_indices],
+                [values[index] for index in name_parameter_indices],
+            )
         combined_configs.append(_config)
     return combined_configs
 
