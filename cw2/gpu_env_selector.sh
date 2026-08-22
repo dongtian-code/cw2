@@ -94,7 +94,27 @@ _mprl_probe_gpu_env() {
             PYTHONNOUSERSITE=1 \
             LD_LIBRARY_PATH="$candidate_ld_library_path" \
             "$candidate_python" -c '
+# MPRL_GPU_ENV_PROBE_BEGIN
+import re
 import torch
+
+
+def architecture_supports_device(architecture, device_capability):
+    match = re.fullmatch(r"(sm|compute)_(\d+)", architecture)
+    if match is None:
+        return False
+
+    architecture_kind, capability_digits = match.groups()
+    architecture_capability = (
+        int(capability_digits[:-1]),
+        int(capability_digits[-1]),
+    )
+    if architecture_kind == "sm":
+        return (
+            architecture_capability[0] == device_capability[0]
+            and architecture_capability[1] <= device_capability[1]
+        )
+    return architecture_capability <= device_capability
 
 if not torch.cuda.is_available():
     print("torch.cuda.is_available() is false")
@@ -102,20 +122,43 @@ if not torch.cuda.is_available():
 
 supported = set(torch.cuda.get_arch_list())
 missing = []
+device_capabilities = []
 for index in range(torch.cuda.device_count()):
-    major, minor = torch.cuda.get_device_capability(index)
+    capability = torch.cuda.get_device_capability(index)
+    device_capabilities.append(capability)
+    major, minor = capability
     suffix = f"{major}{minor}"
-    if f"sm_{suffix}" not in supported and f"compute_{suffix}" not in supported:
+    if not any(
+        architecture_supports_device(architecture, capability)
+        for architecture in supported
+    ):
         missing.append(f"GPU{index}=sm_{suffix}")
 
 if missing:
     print(
-        "unsupported " + ", ".join(missing)
+        "no compatible cubin/PTX for " + ", ".join(missing)
         + "; wheel architectures=" + " ".join(sorted(supported))
     )
     raise SystemExit(3)
 
-print("compatible architectures=" + " ".join(sorted(supported)))
+for index, (major, minor) in enumerate(device_capabilities):
+    try:
+        with torch.cuda.device(index):
+            probe = torch.ones(1, device=f"cuda:{index}", dtype=torch.float32)
+            (probe + 1.0).sum().item()
+            torch.cuda.synchronize(index)
+    except Exception as error:
+        print(
+            f"CUDA runtime probe failed on GPU{index}=sm_{major}{minor}: "
+            f"{type(error).__name__}: {error}"
+        )
+        raise SystemExit(4)
+
+print(
+    "compatible architectures=" + " ".join(sorted(supported))
+    + "; CUDA runtime probe passed"
+)
+# MPRL_GPU_ENV_PROBE_END
 ' 2>&1
     )"; then
         MPRL_GPU_ENV_PROBE_PREFIX="$candidate_prefix"
