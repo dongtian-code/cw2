@@ -1,6 +1,7 @@
 from cw2.cw_data.cw_wandb_logger import (
     WandBLogger,
     build_sweep_group_name,
+    group_parameters,
 )
 
 
@@ -224,3 +225,84 @@ def test_logger_does_not_expand_a_pre_resolved_group_twice(tmp_path):
     logger.init_fields(config, rep=0, rep_log_path=str(tmp_path / "rep_00"))
 
     assert logger.group == "study | pol.arg.tra.nl2"
+
+
+def test_identical_tokens_do_not_recurse_forever():
+    # Two swept parameters can abbreviate to the same short name (cw2's
+    # shorten_param maps both *_min_step_length and *_max_step_length to
+    # "...msl"), so a sweep row where they hold the same value yields two
+    # identical tokens. Grouping those used to recurse until RecursionError.
+    assert group_parameters(["a", "a"]) == ("a", 1)
+    assert group_parameters(["pol.arg.pumsl16", "pol.arg.pumsl16"]) == (
+        "pol_arg_pumsl16",
+        1,
+    )
+    assert group_parameters(
+        ["pol.arg.trslTrue", "pol.arg.tmpsl1", "pol.arg.tmpsl1"]
+    ) == ("pol_arg_[tmpsl1,trslTrue]", 1)
+
+
+def test_tokens_differing_only_in_trailing_dots_do_not_recurse_forever():
+    # A duplicate in the input is not the only way to reach the degenerate
+    # state: any group whose members all peel down to "" gets there, so
+    # de-duplicating the input alone would not be enough.
+    assert group_parameters(["a", "a."]) == ("a", 1)
+    assert group_parameters(["", ""]) == ("", 1)
+    # Reached one level down, where the group is ["", "."]: still terminates,
+    # at the cost of a trailing separator in a name no real parameter produces.
+    assert group_parameters(["a.", "a.."]) == ("a_", 1)
+
+
+def test_repeated_separators_in_a_job_name_do_not_recurse_forever():
+    # The use_group_parameters path feeds job_name.split("_") straight in,
+    # without dropping empty tokens.
+    assert group_parameters("a___b".split("_")) == (",a,b", 3)
+
+
+def test_grouping_of_distinct_parameters_is_unchanged():
+    # Guards the fix against changing any name it must not change.
+    assert group_parameters(
+        [
+            "local",
+            "mod.enc.tidentity",
+            "mod.hea.nhl5",
+            "mod.hea.ioFalse",
+            "mod.enc.hd64",
+        ]
+    ) == ("local,mod_[enc_[hd64,tidentity],hea_[ioFalse,nhl5]]", 2)
+    assert group_parameters(["pol.arg.pumsl1", "pol.arg.pumsl8"]) == (
+        "pol_arg_[pumsl1,pumsl8]",
+        1,
+    )
+
+
+def test_sweep_row_with_equal_min_and_max_keeps_a_distinct_group():
+    # The four rows of the implicit_action_repetition sweep:
+    # (min, max) = (1, 8), (1, 16), (16, 16), (1, 32). The third one used to
+    # crash config processing outright.
+    groups = [
+        build_sweep_group_name(
+            "study",
+            f"experiment__pol.arg.pumsl{minimum}_pol.arg.pumsl{maximum}",
+        )
+        for minimum, maximum in [(1, 8), (1, 16), (16, 16), (1, 32)]
+    ]
+
+    assert groups == [
+        "study | pol_arg_[pumsl1,pumsl8]",
+        "study | pol_arg_[pumsl1,pumsl16]",
+        "study | pol_arg_pumsl16",
+        "study | pol_arg_[pumsl1,pumsl32]",
+    ]
+    assert len(set(groups)) == len(groups)
+
+
+def test_equal_valued_pair_does_not_share_a_group_with_a_single_parameter():
+    # Collapsing the duplicate to one token must not make a two-parameter row
+    # indistinguishable from a row that swept only one of them.
+    pair = build_sweep_group_name(
+        "study", "experiment__pol.arg.pumsl16_pol.arg.pumsl16"
+    )
+    single = build_sweep_group_name("study", "experiment__pol.arg.pumsl16")
+
+    assert pair != single

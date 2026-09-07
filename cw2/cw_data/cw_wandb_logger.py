@@ -63,6 +63,16 @@ def group_parameters(list_of_strings: List[str]):
         else:
             remainder = [s.replace(k, "", 1) for s in groups[-1]]
             remainder = [s.replace(".", "", 1) for s in remainder]
+            # Every member of this group collapsed onto the key itself, so the
+            # remainder is a list of >= 2 empty strings. That is the one state
+            # the peel above cannot shrink ("" is a fixed point of it), so
+            # recursing here never terminates and raises RecursionError.
+            # The key alone already describes every member, so emit it as a
+            # single subgroup instead.
+            if not any(remainder):
+                substring += k + ","
+                num_subgroups += 1
+                continue
             if len(remainder) > 0:
                 subgroups, num_subs = group_parameters(remainder)
                 if num_subs > 1:
