@@ -724,7 +724,7 @@ def _auto_gpu_settings(conf: cw_config.Config):
     if reps_per_gpu < 1:
         raise cw_error.ConfigKeyError("reps_per_gpu must be at least 1.")
 
-    raw_node_counts = slurm_conf.get("auto_gpu_node_counts", [1, 2, 4])
+    raw_node_counts = slurm_conf.get("auto_gpu_node_counts", [1, 2, 4, 10])
     try:
         node_counts = sorted({int(count) for count in raw_node_counts})
     except (TypeError, ValueError) as exc:
@@ -860,6 +860,85 @@ def query_idle_auto_gpu_nodes(
     return idle_counts
 
 
+def query_auto_gpu_node_cpu_limits(
+    conf: cw_config.Config,
+    node_counts: list,
+    gpu_models: list,
+):
+    """Largest CPU count of any partition node per GPU node size.
+
+    GPU count and core count are independent on Maxwell (a GPUx10 RTX8000 node
+    has 128 cores), so gpu_count x reps_per_gpu x cpus_per_rep can exceed every
+    node of a size and leave the array pending forever. Sizes without a
+    matching node are omitted, i.e. not capped.
+    """
+    partition = conf.slurm_config.get("partition")
+    if not partition:
+        raise cw_error.ConfigKeyError(
+            "num_gpus=auto requires a Slurm partition."
+        )
+    delimiter = "\t"
+    command = [
+        "sinfo",
+        "-h",
+        "-N",
+        "-p",
+        partition,
+        "-o",
+        delimiter.join(["%N", "%f", "%c"]),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        raise cw_error.ConfigKeyError(
+            "num_gpus=auto could not inspect Slurm node CPUs with: {}."
+            .format(" ".join(command))
+        ) from exc
+
+    cpu_limits = {}
+    model_features = set(gpu_models)
+    for line in result.stdout.splitlines():
+        fields = line.split(delimiter)
+        if len(fields) != 3:
+            raise cw_error.ConfigKeyError(
+                "Could not parse Slurm node CPU data: {!r}.".format(line)
+            )
+        _node_name, raw_features, raw_cpus = (
+            field.strip() for field in fields
+        )
+        features = {
+            feature.strip()
+            for feature in raw_features.split(",")
+            if feature.strip()
+        }
+        if model_features and not features.intersection(model_features):
+            continue
+        try:
+            node_cpus = int(raw_cpus)
+        except ValueError as exc:
+            raise cw_error.ConfigKeyError(
+                "Could not parse Slurm node CPU count {!r}.".format(raw_cpus)
+            ) from exc
+        for gpu_count in node_counts:
+            if "GPUx{}".format(gpu_count) in features:
+                cpu_limits[gpu_count] = max(
+                    cpu_limits.get(gpu_count, 0),
+                    node_cpus,
+                )
+                break
+    return cpu_limits
+
+
 def _constraint_has_feature(constraint: str, feature: str) -> bool:
     feature_pattern = r"(?<![A-Za-z0-9_.-]){}(?![A-Za-z0-9_.-])"
     return re.search(feature_pattern.format(re.escape(feature)), constraint) is not None
@@ -992,7 +1071,7 @@ def _auto_cpus_per_rep(
     conf: cw_config.Config,
     jobs: list,
     reps_per_gpu: int,
-    node_counts: list,
+    base_gpu_count: int,
 ) -> int:
     configured_cpus_per_rep = conf.slurm_config.get("cpus_per_rep")
     if configured_cpus_per_rep is not None:
@@ -1008,30 +1087,43 @@ def _auto_cpus_per_rep(
             )
         return cpus_per_rep
 
-    max_concurrent_reps = max(node_counts) * reps_per_gpu
+    # cpus-per-task describes the fallback node size, which is also the size
+    # written into sbatch.sh. Larger sizes (GPUx10) only scale it up.
+    base_concurrent_reps = base_gpu_count * reps_per_gpu
     configured_cpus = int(conf.slurm_config["cpus-per-task"])
-    if configured_cpus < max_concurrent_reps:
+    if configured_cpus < base_concurrent_reps:
         raise cw_error.ConfigKeyError(
-            "cpus-per-task is smaller than the maximum number of concurrent "
-            "runs. Set cpus_per_rep explicitly."
+            "cpus-per-task is smaller than the number of concurrent runs on "
+            "the auto_gpu_fallback_count node. Set cpus_per_rep explicitly."
         )
-    if configured_cpus % max_concurrent_reps != 0:
+    if configured_cpus % base_concurrent_reps != 0:
         raise cw_error.ConfigKeyError(
             "Cannot infer an integer cpus_per_rep from cpus-per-task={} and "
             "{} concurrent runs. Set cpus_per_rep explicitly.".format(
                 configured_cpus,
-                max_concurrent_reps,
+                base_concurrent_reps,
             )
         )
-    return configured_cpus // max_concurrent_reps
+    return configured_cpus // base_concurrent_reps
 
 
 def _auto_cpus_per_task(
     gpu_count: int,
     reps_per_gpu: int,
     cpus_per_rep: int,
+    cpu_limit=None,
 ) -> int:
-    return gpu_count * reps_per_gpu * cpus_per_rep
+    requested_cpus = gpu_count * reps_per_gpu * cpus_per_rep
+    if cpu_limit is None or requested_cpus <= cpu_limit:
+        return requested_cpus
+    if cpu_limit < gpu_count * reps_per_gpu:
+        raise cw_error.ConfigKeyError(
+            "GPUx{} nodes have at most {} CPUs, fewer than the {} concurrent "
+            "runs. Lower reps_per_gpu or drop {} from auto_gpu_node_counts."
+            .format(gpu_count, cpu_limit, gpu_count * reps_per_gpu, gpu_count)
+        )
+    # The runtime scheduler shrinks cpus_per_rep to the CPUs it is given.
+    return cpu_limit
 
 
 def _persist_runtime_config(conf: cw_config.Config) -> str:
@@ -1330,16 +1422,29 @@ def _submit_auto_gpu_arrays(
     gpu_models: list,
     reps_per_gpu: int,
     cpus_per_rep: int,
+    cpu_limits=None,
 ):
     max_parallel = int(conf.slurm_config["num_parallel_jobs"])
     throttles = _auto_gpu_group_throttles(assignment, max_parallel)
+    cpu_limits = cpu_limits or {}
     for gpu_count in sorted(assignment, reverse=True):
         constraint = _auto_gpu_constraint(gpu_count, gpu_models)
         cpus_per_task = _auto_cpus_per_task(
             gpu_count,
             reps_per_gpu,
             cpus_per_rep,
+            cpu_limits.get(gpu_count),
         )
+        if cpus_per_task < gpu_count * reps_per_gpu * cpus_per_rep:
+            print(
+                "[slurm] GPUx{}: capped --cpus-per-task to {}, the largest "
+                "matching node; {} CPU(s) per run instead of {}.".format(
+                    gpu_count,
+                    cpus_per_task,
+                    cpus_per_task // (gpu_count * reps_per_gpu),
+                    cpus_per_rep,
+                )
+            )
         array_spec = "{}%{}".format(
             _compress_array_indices(assignment[gpu_count]),
             throttles[gpu_count],
@@ -1395,13 +1500,18 @@ def run_slurm(conf: cw_config.Config, jobs) -> None:
                 auto_gpu_models,
                 _,
             ) = _auto_gpu_settings(conf)
+            auto_base_gpu_count = _auto_gpu_base_count(conf, jobs)
             auto_cpus_per_rep = _auto_cpus_per_rep(
                 conf,
                 jobs,
                 auto_reps_per_gpu,
-                auto_node_counts,
+                auto_base_gpu_count,
             )
-            auto_base_gpu_count = _auto_gpu_base_count(conf, jobs)
+            auto_cpu_limits = query_auto_gpu_node_cpu_limits(
+                conf,
+                auto_node_counts,
+                auto_gpu_models,
+            )
             sbatch_args = conf.slurm_config.setdefault("sbatch_args", {})
             sbatch_args["constraint"] = _auto_gpu_constraint(
                 auto_base_gpu_count,
@@ -1412,6 +1522,7 @@ def run_slurm(conf: cw_config.Config, jobs) -> None:
                 auto_base_gpu_count,
                 auto_reps_per_gpu,
                 auto_cpus_per_rep,
+                auto_cpu_limits.get(auto_base_gpu_count),
             )
             conf.slurm_config["auto_gpu_job_capacities"] = (
                 auto_job_capacities
@@ -1436,6 +1547,7 @@ def run_slurm(conf: cw_config.Config, jobs) -> None:
             auto_gpu_models,
             auto_reps_per_gpu,
             auto_cpus_per_rep,
+            auto_cpu_limits,
         )
         return
     command = ["sbatch", slurm_script]

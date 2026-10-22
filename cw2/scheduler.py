@@ -347,6 +347,26 @@ class HOREKAAffinityGPUDistributingLocalScheduler(GPUDistributingLocalScheduler)
                 and self._cpus_per_rep == configured_cpus_per_rep
             ), "cpus_per_rep must be a positive integer"
             required_cpu_count = self._cpus_per_rep * self._queue_elements
+            granted_cpu_count = (
+                min(self._total_cpus(conf), len(self._allowed_cpus))
+                if self._auto_num_gpus
+                else len(self._allowed_cpus)
+            )
+            if required_cpu_count > granted_cpu_count and self._auto_num_gpus:
+                # Submission capped --cpus-per-task to the largest node of
+                # this GPU size (e.g. GPUx10 with 128 cores).
+                self._cpus_per_rep = granted_cpu_count // self._queue_elements
+                print(
+                    "Auto GPU scheduling: {} CPUs for {} runs, lowering "
+                    "cpus_per_rep from {} to {}.".format(
+                        granted_cpu_count,
+                        self._queue_elements,
+                        configured_cpus_per_rep,
+                        self._cpus_per_rep,
+                    ),
+                    flush=True,
+                )
+                required_cpu_count = self._cpus_per_rep * self._queue_elements
             assert required_cpu_count <= len(self._allowed_cpus), (
                 "Slurm allocated {} CPUs, but {} GPUs x {} reps_per_gpu x "
                 "{} cpus_per_rep requires {} CPUs.".format(
@@ -359,17 +379,26 @@ class HOREKAAffinityGPUDistributingLocalScheduler(GPUDistributingLocalScheduler)
             )
             self._usable_cpus = self._allowed_cpus[:required_cpu_count]
         else:
-            total_cpus = (
-                conf.slurm_config["cpus-per-task"]
-                * conf.slurm_config["ntasks"]
+            usable_cpu_count = min(
+                self._total_cpus(conf),
+                len(self._allowed_cpus),
             )
-            usable_cpu_count = min(total_cpus, len(self._allowed_cpus))
             self._usable_cpus = self._allowed_cpus[:usable_cpu_count]
             self._cpus_per_rep = usable_cpu_count // self._queue_elements
 
         assert (
             self._cpus_per_rep > 0
         ), "Not enough CPUs for the number of GPUs requested"
+
+    def _total_cpus(self, conf: cw_config.Config) -> int:
+        cpus_per_task = conf.slurm_config["cpus-per-task"]
+        # Under num_gpus=auto every GPU size is its own sbatch --array with its
+        # own --cpus-per-task, while the persisted config only holds the
+        # fallback size's value.
+        slurm_cpus_per_task = os.environ.get("SLURM_CPUS_PER_TASK")
+        if self._auto_num_gpus and slurm_cpus_per_task:
+            cpus_per_task = int(slurm_cpus_per_task)
+        return cpus_per_task * conf.slurm_config["ntasks"]
 
     def run(self, overwrite: bool = False):
         print("Seeing CPUs:", os.sched_getaffinity(0), flush=True)

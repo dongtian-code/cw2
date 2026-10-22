@@ -423,8 +423,122 @@ def test_auto_cpu_per_rep_can_be_inferred_from_legacy_config():
         conf,
         [_job(4)],
         reps_per_gpu=1,
-        node_counts=[1, 2, 4],
+        base_gpu_count=4,
     ) == 16
+
+
+def test_auto_cpu_per_rep_inference_ignores_larger_node_sizes():
+    conf = _config(node_counts=(1, 2, 4, 10), fallback_count=4)
+    del conf.slurm_config["cpus_per_rep"]
+
+    # 64 / 10 would not divide; the value describes the fallback GPUx4 node.
+    assert cw_slurm._auto_cpus_per_rep(
+        conf,
+        [_job(40)],
+        reps_per_gpu=1,
+        base_gpu_count=4,
+    ) == 16
+
+
+def test_node_cpu_limit_query_takes_largest_matching_node(monkeypatch):
+    conf = _config(node_counts=(1, 2, 4, 10))
+    conf.slurm_config["auto_gpu_models"] = ["A100", "RTX8000", "L40S"]
+
+    monkeypatch.setattr(
+        cw_slurm.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout="\n".join(
+                [
+                    "node-rtx8000-a\tEPYC,GPU,GPUx10,RTX8000\t128",
+                    "node-rtx8000-b\tEPYC,GPU,GPUx10,RTX8000\t128",
+                    "node-l40s-10\tINTEL,GPU,GPUx10,L40S\t96",
+                    "node-h200-10\tEPYC,GPU,GPUx10,H200\t512",
+                    "node-a100-4a\tEPYC,GPU,GPUx4,A100\t72",
+                    "node-a100-4b\tEPYC,GPU,GPUx4,A100\t192",
+                    "node-a100-1\tEPYC,GPU,GPUx1,A100\t40",
+                ]
+            )
+        ),
+    )
+
+    assert cw_slurm.query_auto_gpu_node_cpu_limits(
+        conf,
+        [1, 2, 4, 10],
+        ["A100", "RTX8000", "L40S"],
+    ) == {10: 128, 4: 192, 1: 40}
+
+
+def test_auto_cpu_request_is_capped_to_largest_node():
+    assert cw_slurm._auto_cpus_per_task(
+        gpu_count=10,
+        reps_per_gpu=2,
+        cpus_per_rep=16,
+        cpu_limit=128,
+    ) == 128
+    assert cw_slurm._auto_cpus_per_task(
+        gpu_count=4,
+        reps_per_gpu=1,
+        cpus_per_rep=16,
+        cpu_limit=192,
+    ) == 64
+    with pytest.raises(cw_error.ConfigKeyError, match="at most 8 CPUs"):
+        cw_slurm._auto_cpus_per_task(
+            gpu_count=10,
+            reps_per_gpu=1,
+            cpus_per_rep=16,
+            cpu_limit=8,
+        )
+
+
+def test_auto_gpu_assignment_fills_idle_ten_gpu_nodes_first():
+    conf = _config(node_counts=(1, 2, 4, 10), fallback_count=4)
+
+    assignment, capacities = cw_slurm.resolve_auto_gpu_resources(
+        conf,
+        [_job(28)],
+        idle_node_counts={10: 2, 4: 1, 2: 0, 1: 0},
+        pending_node_counts={},
+        return_job_capacities=True,
+    )
+
+    # Idle GPUx10 nodes take 20 runs, the idle GPUx4 4 more; the last 4 go to
+    # the fallback balancing, which never picks the larger GPUx10 size.
+    assert assignment == {10: [0, 1], 4: [2, 3]}
+    assert capacities == [10, 10, 4, 4]
+
+
+def test_auto_gpu_submission_caps_ten_gpu_cpus(monkeypatch):
+    conf = _config(node_counts=(1, 2, 4, 10))
+    submitted = []
+    monkeypatch.setattr(
+        cw_slurm.subprocess,
+        "check_output",
+        lambda command: submitted.append(command),
+    )
+
+    cw_slurm._submit_auto_gpu_arrays(
+        conf,
+        {10: [0, 1], 4: [2]},
+        "/tmp/sbatch.sh",
+        ["A100", "RTX8000"],
+        reps_per_gpu=1,
+        cpus_per_rep=16,
+        cpu_limits={10: 128, 4: 192},
+    )
+
+    assert [command[1:4] for command in submitted] == [
+        [
+            "--array=0-1%2",
+            "--constraint=GPUx10&(A100|RTX8000)",
+            "--cpus-per-task=128",
+        ],
+        [
+            "--array=2%1",
+            "--constraint=GPUx4&(A100|RTX8000)",
+            "--cpus-per-task=64",
+        ],
+    ]
 
 
 def test_auto_gpu_group_throttles_preserve_global_limit():
@@ -495,3 +609,40 @@ def test_horeka_scheduler_honors_explicit_cpus_per_rep(monkeypatch):
     assert scheduler._queue_elements == 2
     assert scheduler._cpus_per_rep == 16
     assert scheduler._usable_cpus == list(range(32))
+
+
+def test_horeka_scheduler_shrinks_cpus_per_rep_on_ten_gpu_node(monkeypatch):
+    conf = _config(node_counts=(1, 2, 4, 10), fallback_count=4)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(map(str, range(10))))
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "128")
+    monkeypatch.setattr(
+        scheduler_module.os,
+        "sched_getaffinity",
+        lambda _pid: set(range(128)),
+        raising=False,
+    )
+
+    scheduler = HOREKAAffinityGPUDistributingLocalScheduler(conf)
+
+    assert scheduler._queue_elements == 10
+    assert scheduler._cpus_per_rep == 12
+    assert scheduler._usable_cpus == list(range(120))
+
+
+def test_horeka_scheduler_uses_slurm_cpus_for_inferred_cpus_per_rep(monkeypatch):
+    conf = _config(node_counts=(1, 2, 4, 10), fallback_count=4)
+    del conf.slurm_config["cpus_per_rep"]
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(map(str, range(10))))
+    # The persisted config says 64 (the GPUx4 fallback); this array got 128.
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "128")
+    monkeypatch.setattr(
+        scheduler_module.os,
+        "sched_getaffinity",
+        lambda _pid: set(range(128)),
+        raising=False,
+    )
+
+    scheduler = HOREKAAffinityGPUDistributingLocalScheduler(conf)
+
+    assert scheduler._cpus_per_rep == 12
+    assert scheduler._usable_cpus == list(range(128))
