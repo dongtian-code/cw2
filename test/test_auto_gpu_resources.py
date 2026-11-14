@@ -646,3 +646,137 @@ def test_horeka_scheduler_uses_slurm_cpus_for_inferred_cpus_per_rep(monkeypatch)
 
     assert scheduler._cpus_per_rep == 12
     assert scheduler._usable_cpus == list(range(128))
+
+
+def test_auto_gpu_fallback_is_proportional_to_usable_node_counts():
+    conf = _config(fallback_count=4)
+
+    assignment, capacities = cw_slurm.resolve_auto_gpu_resources(
+        conf,
+        [_job(216)],
+        idle_node_counts={4: 0, 2: 0, 1: 0},
+        total_node_counts={1: 62, 2: 11, 4: 33},
+        return_job_capacities=True,
+    )
+
+    # 62 + 2*11 + 4*33 = 216 runs: exactly one array task per usable node.
+    assert {count: len(indices) for count, indices in assignment.items()} == {
+        1: 62,
+        2: 11,
+        4: 33,
+    }
+    assert sum(capacities) == 216
+
+
+def test_auto_gpu_fallback_proportional_rounds_close_to_node_ratio():
+    conf = _config(fallback_count=4)
+
+    assignment, capacities = cw_slurm.resolve_auto_gpu_resources(
+        conf,
+        [_job(196)],
+        idle_node_counts={4: 0, 2: 0, 1: 0},
+        total_node_counts={1: 62, 2: 11, 4: 33},
+        return_job_capacities=True,
+    )
+
+    assert {count: len(indices) for count, indices in assignment.items()} == {
+        1: 56,
+        2: 10,
+        4: 30,
+    }
+    assert sum(capacities) == 196
+
+
+def test_auto_gpu_fallback_skips_sizes_without_usable_nodes():
+    conf = _config(fallback_count=4)
+
+    assignment = cw_slurm.resolve_auto_gpu_resources(
+        conf,
+        [_job(16)],
+        idle_node_counts={4: 0, 2: 0, 1: 0},
+        total_node_counts={1: 5, 2: 0, 4: 5},
+    )
+
+    # Equal GPUx1/GPUx4 node counts -> equal task counts, none on GPUx2.
+    assert {count: len(indices) for count, indices in assignment.items()} == {
+        1: 4,
+        4: 3,
+    }
+
+
+def test_auto_gpu_fallback_proportion_accumulates_across_groups():
+    conf = _config(fallback_count=4)
+    jobs = [
+        SimpleNamespace(
+            tasks=[{config_keys.NAME: "exp_{}".format(group)} for _ in range(4)],
+            n_parallel=4,
+        )
+        for group in range(12)
+    ]
+
+    assignment = cw_slurm.resolve_auto_gpu_resources(
+        conf,
+        jobs,
+        idle_node_counts={4: 0, 2: 0, 1: 0},
+        total_node_counts={1: 2, 2: 0, 4: 1},
+    )
+
+    # Each group of 4 runs fits one GPUx4 task or four GPUx1 tasks. A
+    # per-group rounding would pick the same size every time; accumulated
+    # weighting keeps GPUx1:GPUx4 tasks near 2:1 overall.
+    n1 = len(assignment.get(1, []))
+    n4 = len(assignment.get(4, []))
+    assert n1 + 4 * n4 == 48
+    assert n4 > 0 and n1 > 0
+    assert abs(n1 / 2 - n4) <= 2
+
+
+def test_auto_gpu_fallback_balanced_strategy_ignores_node_counts():
+    conf = _config(fallback_count=4)
+    conf.slurm_config["auto_gpu_fallback_strategy"] = "balanced"
+
+    assignment = cw_slurm.resolve_auto_gpu_resources(
+        conf,
+        [_job(42)],
+        idle_node_counts={4: 0, 2: 0, 1: 0},
+        total_node_counts={1: 62, 2: 11, 4: 33},
+    )
+
+    assert {count: len(indices) for count, indices in assignment.items()} == {
+        1: 6,
+        2: 6,
+        4: 6,
+    }
+
+
+def test_total_node_query_excludes_p100_v100_and_unusable_states(monkeypatch):
+    conf = _config()
+    conf.slurm_config["auto_gpu_models"] = []
+
+    monkeypatch.setattr(
+        cw_slurm.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout="\n".join(
+                [
+                    "n1\tGPU,GPUx1,A100\tallocated",
+                    "n1\tGPU,GPUx1,A100\tallocated",
+                    "n2\tGPU,GPUx1,H200\treserved",
+                    "n3\tGPU,GPUx1,P100\tidle",
+                    "n4\tGPU,GPUx1,V100\tallocated",
+                    "n5\tGPU,GPUx2,A6000\tidle~",
+                    "n6\tGPU,GPUx2,H100\tdrained*",
+                    "n7\tGPU,GPUx4,L40S\tmixed",
+                    "n8\tGPU,GPUx4,A100\tdown*",
+                    "n9\tGPU,GPUx4,V100\tallocated",
+                ]
+            )
+        ),
+    )
+
+    assert cw_slurm.query_total_auto_gpu_nodes(
+        conf,
+        [1, 2, 4],
+        [],
+        cw_slurm._auto_gpu_fallback_exclude_models(conf),
+    ) == {1: 2, 2: 1, 4: 1}

@@ -939,6 +939,131 @@ def query_auto_gpu_node_cpu_limits(
     return cpu_limits
 
 
+_UNUSABLE_NODE_STATES = (
+    "down",
+    "drain",
+    "drng",
+    "fail",
+    "inval",
+    "maint",
+    "unk",
+    "future",
+    "no_respond",
+    "power_down",
+    "powering_down",
+)
+
+
+def _auto_gpu_fallback_exclude_models(conf: cw_config.Config) -> set:
+    raw_models = conf.slurm_config.get(
+        "auto_gpu_fallback_exclude_models",
+        ["P100", "V100"],
+    )
+    if raw_models is None:
+        return set()
+    if isinstance(raw_models, str):
+        raw_models = [raw_models]
+    if not isinstance(raw_models, list):
+        raise cw_error.ConfigKeyError(
+            "auto_gpu_fallback_exclude_models must be a list of Slurm node "
+            "feature names."
+        )
+    return {str(model).strip() for model in raw_models if str(model).strip()}
+
+
+def _auto_gpu_fallback_strategy(conf: cw_config.Config) -> str:
+    strategy = str(
+        conf.slurm_config.get("auto_gpu_fallback_strategy", "node_proportional")
+    ).strip().lower()
+    if strategy not in {"node_proportional", "balanced"}:
+        raise cw_error.ConfigKeyError(
+            "auto_gpu_fallback_strategy must be 'node_proportional' or "
+            "'balanced'."
+        )
+    return strategy
+
+
+def query_total_auto_gpu_nodes(
+    conf: cw_config.Config,
+    node_counts: list,
+    gpu_models: list,
+    exclude_models=None,
+):
+    """Usable partition nodes per GPU node size, regardless of busy state.
+
+    Used as weights when spreading runs that exceed the currently idle nodes:
+    each size gets array tasks in proportion to how many nodes of that size can
+    eventually run them. Nodes carrying an excluded GPU model (P100/V100 by
+    default) and nodes that are down/drained do not count.
+    """
+    partition = conf.slurm_config.get("partition")
+    if not partition:
+        raise cw_error.ConfigKeyError(
+            "num_gpus=auto requires a Slurm partition."
+        )
+    delimiter = "\t"
+    command = [
+        "sinfo",
+        "-h",
+        "-N",
+        "-p",
+        partition,
+        "-o",
+        delimiter.join(["%N", "%f", "%T"]),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
+        raise cw_error.ConfigKeyError(
+            "num_gpus=auto could not inspect Slurm nodes with: {}."
+            .format(" ".join(command))
+        ) from exc
+
+    total_counts = {count: 0 for count in node_counts}
+    model_features = set(gpu_models)
+    excluded_features = set(exclude_models or ())
+    counted_nodes = set()
+    for line in result.stdout.splitlines():
+        fields = line.split(delimiter)
+        if len(fields) != 3:
+            raise cw_error.ConfigKeyError(
+                "Could not parse Slurm node data: {!r}.".format(line)
+            )
+        node_name, raw_features, state = (
+            field.strip() for field in fields
+        )
+        if node_name in counted_nodes:
+            continue
+        normalized_state = state.lower().rstrip("~#!%$@^-*+")
+        if normalized_state.startswith(_UNUSABLE_NODE_STATES):
+            continue
+        features = {
+            feature.strip()
+            for feature in raw_features.split(",")
+            if feature.strip()
+        }
+        if model_features and not features.intersection(model_features):
+            continue
+        if features.intersection(excluded_features):
+            continue
+        for gpu_count in node_counts:
+            if "GPUx{}".format(gpu_count) in features:
+                total_counts[gpu_count] += 1
+                counted_nodes.add(node_name)
+                break
+    return total_counts
+
+
 def _constraint_has_feature(constraint: str, feature: str) -> bool:
     feature_pattern = r"(?<![A-Za-z0-9_.-]){}(?![A-Za-z0-9_.-])"
     return re.search(feature_pattern.format(re.escape(feature)), constraint) is not None
@@ -1141,7 +1266,18 @@ def _balanced_fallback_job_counts(
     reps_per_gpu: int,
     node_counts: list,
     fallback_count: int,
+    node_weights=None,
+    previous_allocation=None,
 ):
+    """Split runs beyond the idle capacity over fully occupied node sizes.
+
+    Array tasks per node size are kept proportional to ``node_weights`` (the
+    number of usable nodes of each size), i.e. the queue load per node is
+    equalized. ``previous_allocation`` carries the fallback tasks already
+    placed for earlier experiment groups so the proportion holds across the
+    whole submission rather than being rounded the same way in every group.
+    Without weights every size counts equally (the legacy balanced split).
+    """
     eligible_counts = sorted(
         (count for count in node_counts if count <= fallback_count),
         reverse=True,
@@ -1150,6 +1286,22 @@ def _balanced_fallback_job_counts(
         return {count: 0 for count in eligible_counts}
     if not eligible_counts or remaining_tasks % reps_per_gpu != 0:
         return None
+
+    weights = {
+        count: (
+            1
+            if node_weights is None
+            else max(0, int(node_weights.get(count, 0)))
+        )
+        for count in eligible_counts
+    }
+    if not any(weights.values()):
+        weights = {count: 1 for count in eligible_counts}
+    previous = {
+        count: int((previous_allocation or {}).get(count, 0))
+        for count in eligible_counts
+    }
+    weighted_counts = [count for count in eligible_counts if weights[count]]
 
     remaining_gpu_units = remaining_tasks // reps_per_gpu
     allocation = {count: 0 for count in eligible_counts}
@@ -1160,16 +1312,25 @@ def _balanced_fallback_job_counts(
         nonlocal best_score, best_allocation
         # Idle-node assignments are already runnable and must not distort the
         # balancing of jobs that exceed currently available capacity.
-        values = list(allocation.values())
-        spread = max(values) - min(values)
+        unusable_jobs = sum(
+            allocation[count]
+            for count in eligible_counts
+            if not weights[count]
+        )
+        loads = [
+            (previous[count] + allocation[count]) / weights[count]
+            for count in weighted_counts
+        ]
+        spread = max(loads) - min(loads)
         pairwise_imbalance = sum(
-            (values[left] - values[right]) ** 2
-            for left in range(len(values))
-            for right in range(left + 1, len(values))
+            (loads[left] - loads[right]) ** 2
+            for left in range(len(loads))
+            for right in range(left + 1, len(loads))
         )
         score = (
-            spread,
-            pairwise_imbalance,
+            unusable_jobs,
+            round(spread, 9),
+            round(pairwise_imbalance, 9),
             sum(allocation.values()),
             tuple(-allocation[count] for count in eligible_counts),
         )
@@ -1205,6 +1366,7 @@ def resolve_auto_gpu_resources(
     idle_node_counts=None,
     pending_node_counts=None,
     return_job_capacities=False,
+    total_node_counts=None,
 ):
     configured_num_gpus = conf.slurm_config.get("num_gpus", 0)
     if not (
@@ -1282,6 +1444,31 @@ def resolve_auto_gpu_resources(
     }
     remaining_idle_by_count = dict(available_by_count)
 
+    fallback_strategy = _auto_gpu_fallback_strategy(conf)
+    if fallback_strategy == "node_proportional":
+        if total_node_counts is None and queried_idle_nodes:
+            total_node_counts = query_total_auto_gpu_nodes(
+                conf,
+                node_counts,
+                gpu_models,
+                _auto_gpu_fallback_exclude_models(conf),
+            )
+    else:
+        total_node_counts = None
+    fallback_weights = None
+    if total_node_counts is not None:
+        try:
+            fallback_weights = {
+                count: max(0, int(total_node_counts.get(count, 0)))
+                for count in node_counts
+            }
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise cw_error.ConfigKeyError(
+                "total_node_counts must map GPU node sizes to non-negative "
+                "counts."
+            ) from exc
+    fallback_allocation = {count: 0 for count in node_counts}
+
     assignment = {count: [] for count in node_counts}
     job_capacities = []
 
@@ -1309,6 +1496,8 @@ def resolve_auto_gpu_resources(
             reps_per_gpu=reps_per_gpu,
             node_counts=node_counts,
             fallback_count=fallback_count,
+            node_weights=fallback_weights,
+            previous_allocation=fallback_allocation,
         )
         if fallback_jobs is None:
             raise cw_error.ConfigKeyError(
@@ -1321,6 +1510,7 @@ def resolve_auto_gpu_resources(
             )
         for gpu_count in sorted(fallback_jobs, reverse=True):
             add_jobs(gpu_count, fallback_jobs[gpu_count])
+            fallback_allocation[gpu_count] += fallback_jobs[gpu_count]
 
     assignment = {
         count: indices
@@ -1339,6 +1529,18 @@ def resolve_auto_gpu_resources(
         print(
             "[slurm] Effective idle GPU nodes after pending-demand "
             "subtraction: {}.".format(available_by_count)
+        )
+    if fallback_weights is not None:
+        print(
+            "[slurm] Runs beyond idle capacity are split in proportion to "
+            "usable nodes per size {} -> fallback array tasks {}.".format(
+                fallback_weights,
+                {
+                    count: jobs
+                    for count, jobs in fallback_allocation.items()
+                    if jobs
+                },
+            )
         )
     for gpu_count in sorted(assignment, reverse=True):
         print(
